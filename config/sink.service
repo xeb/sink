@@ -1,0 +1,27 @@
+[Unit]
+Description=Sink - iMessage to Claude daemon
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/sink
+Restart=always
+RestartSec=10
+User=youruser
+Group=youruser
+WorkingDirectory=/path/to/working/directory
+Environment=SINK_CONFIG=/etc/sink/config.toml
+Environment=RUST_LOG=sink=info
+Environment=PATH=/path/to/node/bin:/usr/local/bin:/usr/bin:/bin
+Environment=HOME=/home/youruser
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=sink
+
+# No filesystem restrictions - Claude needs full disk access
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

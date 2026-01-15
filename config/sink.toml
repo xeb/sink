@@ -1,0 +1,17 @@
+[bluebubbles]
+host = "your-bluebubbles-host"
+port = 1235
+password = "CHANGEME_PASSWORD"
+
+[claude]
+working_dir = "/path/to/working/directory"
+binary = "/path/to/claude"
+
+[polling]
+interval_secs = 5
+
+[database]
+path = "/var/lib/sink/messages.db"
+
+[context]
+message_history_count = 10
