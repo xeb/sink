@@ -1,8 +1,9 @@
 use crate::error::Result;
 use rusqlite::{params, Connection, OptionalExtension};
+use serde::Serialize;
 use std::path::Path;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 #[allow(dead_code)]
 pub struct Message {
     pub id: Option<i64>,
@@ -16,10 +17,18 @@ pub struct Message {
     pub session_id: Option<String>,
     pub status: String,
     pub is_from_me: bool,
+    pub gemini_reason: Option<String>,
 }
 
 pub struct Database {
     conn: Connection,
+}
+
+impl Database {
+    /// Get a reference to the underlying connection (for web queries)
+    pub fn conn(&self) -> &Connection {
+        &self.conn
+    }
 }
 
 impl Database {
@@ -48,7 +57,8 @@ impl Database {
                 response_guid TEXT,
                 session_id TEXT,
                 status TEXT DEFAULT 'pending',
-                is_from_me INTEGER NOT NULL DEFAULT 0
+                is_from_me INTEGER NOT NULL DEFAULT 0,
+                gemini_reason TEXT
             );
 
             CREATE INDEX IF NOT EXISTS idx_messages_chat_guid ON messages(chat_guid);
@@ -56,6 +66,17 @@ impl Database {
             CREATE INDEX IF NOT EXISTS idx_messages_date ON messages(date_received);
             "#,
         )?;
+
+        // Migration: add gemini_reason column if it doesn't exist
+        let has_gemini_reason: bool = self.conn.query_row(
+            "SELECT COUNT(*) > 0 FROM pragma_table_info('messages') WHERE name = 'gemini_reason'",
+            [],
+            |row| row.get(0),
+        )?;
+        if !has_gemini_reason {
+            self.conn.execute("ALTER TABLE messages ADD COLUMN gemini_reason TEXT", [])?;
+        }
+
         Ok(())
     }
 
@@ -92,7 +113,7 @@ impl Database {
         let mut stmt = self.conn.prepare(
             r#"
             SELECT id, guid, chat_guid, sender, text, date_received,
-                   processed_at, response_guid, session_id, status, is_from_me
+                   processed_at, response_guid, session_id, status, is_from_me, gemini_reason
             FROM messages
             WHERE status = 'pending' AND is_from_me = 0
             ORDER BY date_received ASC
@@ -113,6 +134,7 @@ impl Database {
                     session_id: row.get(8)?,
                     status: row.get(9)?,
                     is_from_me: row.get::<_, i32>(10)? != 0,
+                    gemini_reason: row.get(11)?,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -124,7 +146,7 @@ impl Database {
         let mut stmt = self.conn.prepare(
             r#"
             SELECT id, guid, chat_guid, sender, text, date_received,
-                   processed_at, response_guid, session_id, status, is_from_me
+                   processed_at, response_guid, session_id, status, is_from_me, gemini_reason
             FROM messages
             WHERE chat_guid = ?
             ORDER BY date_received DESC
@@ -146,6 +168,7 @@ impl Database {
                     session_id: row.get(8)?,
                     status: row.get(9)?,
                     is_from_me: row.get::<_, i32>(10)? != 0,
+                    gemini_reason: row.get(11)?,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -169,7 +192,7 @@ impl Database {
         self.conn.execute(
             r#"
             UPDATE messages
-            SET status = 'completed', processed_at = ?, response_guid = ?, session_id = ?
+            SET status = 'replied', processed_at = ?, response_guid = ?, session_id = ?
             WHERE guid = ?
             "#,
             params![now, response_guid, session_id, guid],
@@ -207,5 +230,25 @@ impl Database {
             |row| row.get(0),
         )?;
         Ok(processing)
+    }
+
+    /// Mark a message as not directed at Claude (for group chat filtering)
+    pub fn mark_not_for_claude(&self, guid: &str, reason: &str) -> Result<()> {
+        let now = chrono::Utc::now().timestamp_millis();
+        self.conn.execute(
+            "UPDATE messages SET status = 'not_for_claude', processed_at = ?, gemini_reason = ? WHERE guid = ?",
+            params![now, reason, guid],
+        )?;
+        Ok(())
+    }
+
+    /// Recover any messages stuck in "processing" status (e.g., after a crash)
+    /// Returns the number of messages recovered
+    pub fn recover_stuck_processing(&self) -> Result<usize> {
+        let count = self.conn.execute(
+            "UPDATE messages SET status = 'pending' WHERE status = 'processing'",
+            [],
+        )?;
+        Ok(count)
     }
 }

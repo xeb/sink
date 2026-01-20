@@ -22,6 +22,15 @@ pub enum SinkError {
 
     #[error("Claude invocation failed: {0}")]
     Claude(String),
+
+    #[error("Gemini API error: {0}")]
+    Gemini(String),
+
+    #[error("Notification error: {0}")]
+    Notification(String),
+
+    #[error("Command parse error: {0}")]
+    CommandParse(String),
 }
 
 pub type Result<T> = std::result::Result<T, SinkError>;

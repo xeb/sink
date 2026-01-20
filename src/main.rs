@@ -1,21 +1,32 @@
 mod claude;
+mod commands;
 mod config;
 mod db;
 mod error;
+mod followups;
+mod gemini;
 mod poller;
+mod scheduler;
 mod sender;
+mod transcripts;
+mod web;
 
 use crate::claude::ClaudeInvoker;
+use crate::commands::{CommandHandler, CommandParser};
 use crate::config::Config;
 use crate::db::Database;
 use crate::error::Result;
+use crate::followups::{Followup, FollowupsDb};
+use crate::gemini::GeminiExtractor;
 use crate::poller::Poller;
+use crate::scheduler::NotificationScheduler;
 use crate::sender::Sender;
+use crate::transcripts::{Transcript, TranscriptsDb};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::time::{interval, Duration};
-use tracing::{error, info};
+use tracing::{debug, error, info, warn};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -31,7 +42,10 @@ async fn main() -> Result<()> {
 
     // Record startup time - only process messages after this
     let startup_time = chrono::Utc::now().timestamp_millis();
-    info!("Startup time: {} (will ignore older messages)", startup_time);
+    info!(
+        "Startup time: {} (will ignore older messages)",
+        startup_time
+    );
 
     // Load config
     let config_path = std::env::var("SINK_CONFIG")
@@ -42,13 +56,59 @@ async fn main() -> Result<()> {
         info!("Loading config from {:?}", config_path);
         Config::load(&config_path)?
     } else {
-        info!("Using default config (no config file found at {:?})", config_path);
+        info!(
+            "Using default config (no config file found at {:?})",
+            config_path
+        );
         Config::default()
     };
 
-    // Open database
+    // Open main database
     info!("Opening database at {:?}", config.database.path);
     let db = Database::open(&config.database.path)?;
+
+    // Recover any messages stuck in "processing" from a previous crash
+    match db.recover_stuck_processing() {
+        Ok(count) if count > 0 => {
+            warn!("Recovered {} message(s) stuck in 'processing' status", count);
+        }
+        Ok(_) => {}
+        Err(e) => {
+            error!("Failed to recover stuck messages: {}", e);
+        }
+    }
+
+    // Open transcripts database (if configured via databases section)
+    let transcripts_db_path = config
+        .databases
+        .as_ref()
+        .map(|d| d.transcripts.clone())
+        .unwrap_or_else(|| PathBuf::from("/var/lib/sink/transcripts.db"));
+    let transcripts_db = TranscriptsDb::open(&transcripts_db_path)?;
+    info!("Transcripts database at {:?}", transcripts_db_path);
+
+    // Open followups database (if configured)
+    let followups_db_path = config
+        .databases
+        .as_ref()
+        .map(|d| d.followups.clone())
+        .unwrap_or_else(|| PathBuf::from("/var/lib/sink/followups.db"));
+    let followups_db = FollowupsDb::open(&followups_db_path)?;
+    info!("Followups database at {:?}", followups_db_path);
+
+    // Initialize Gemini extractor (if configured and API key available)
+    let gemini = config.gemini.as_ref().and_then(|g| {
+        match GeminiExtractor::new(g.clone()) {
+            Some(extractor) => {
+                info!("Gemini extractor enabled (model: {})", g.model);
+                Some(extractor)
+            }
+            None => {
+                warn!("Gemini configured but no API key found (set GEMINI_API_KEY env var or api_key in config)");
+                None
+            }
+        }
+    });
 
     // Initialize components
     let poller = Poller::new(config.clone());
@@ -64,6 +124,61 @@ async fn main() -> Result<()> {
         info!("Received shutdown signal");
         r.store(false, Ordering::SeqCst);
     });
+
+    // Spawn notification scheduler (if notifications enabled)
+    if let Some(ref notif_config) = config.notifications {
+        if notif_config.enabled {
+            let scheduler = NotificationScheduler::new(
+                followups_db_path.clone(),
+                transcripts_db_path.clone(),
+                config.clone(),
+                notif_config.clone(),
+                running.clone(),
+            );
+            tokio::spawn(async move {
+                scheduler.run().await;
+            });
+            info!("Notification scheduler spawned");
+        }
+    } else {
+        // Default: enable scheduler if gemini is configured
+        if config.gemini.is_some() {
+            let default_notif_config = crate::config::NotificationsConfig {
+                enabled: true,
+                scheduler_interval_secs: 60,
+                default_snooze_mins: 60,
+                max_retries: 3,
+            };
+            let scheduler = NotificationScheduler::new(
+                followups_db_path.clone(),
+                transcripts_db_path.clone(),
+                config.clone(),
+                default_notif_config,
+                running.clone(),
+            );
+            tokio::spawn(async move {
+                scheduler.run().await;
+            });
+            info!("Notification scheduler spawned (default config)");
+        }
+    }
+
+    // Spawn web server (if enabled)
+    let web_enabled = config.web_server.as_ref().map(|w| w.enabled).unwrap_or(true);
+    if web_enabled {
+        let web_config = config.web_server.clone().unwrap_or_default();
+        let state = web::AppState {
+            db_path: config.database.path.clone(),
+            transcripts_db_path: transcripts_db_path.clone(),
+            followups_db_path: followups_db_path.clone(),
+        };
+        let host = web_config.host.clone();
+        let port = web_config.port;
+        tokio::spawn(async move {
+            web::run_server(state, &host, port).await;
+        });
+        info!("Admin panel at http://{}:{}", web_config.host, web_config.port);
+    }
 
     info!(
         "Starting poll loop (interval: {}s)",
@@ -118,13 +233,101 @@ async fn main() -> Result<()> {
             msg.sender, msg.chat_guid
         );
 
+        // Check if this is a control command (before Claude invocation)
+        if let Some(command) = CommandParser::parse(&msg.text) {
+            info!("Detected control command: {:?}", command);
+
+            let default_snooze = config
+                .notifications
+                .as_ref()
+                .map(|n| n.default_snooze_mins)
+                .unwrap_or(60);
+
+            let handler = CommandHandler::new(&followups_db, default_snooze);
+            match handler.handle(command, &msg.chat_guid, &msg.sender) {
+                Ok(response) => {
+                    if let Err(e) = sender.send_with_retry(&msg.chat_guid, &response, 3).await {
+                        error!("Failed to send command response: {}", e);
+                    }
+                    if let Err(e) = db.mark_processed(&msg.guid, None, None) {
+                        error!("Failed to mark command as processed: {}", e);
+                    }
+                }
+                Err(e) => {
+                    error!("Command handler error: {}", e);
+                    let _ = db.mark_failed(&msg.guid);
+                }
+            }
+            continue; // Skip Claude invocation for commands
+        }
+
+        // For group chats, check if message is addressed to Claude
+        if let Some(ref gemini_client) = gemini {
+            match poller.get_chat_participant_count(&msg.chat_guid).await {
+                Ok(participant_count) => {
+                    if participant_count > 2 {
+                        debug!(
+                            "Group chat detected ({} participants), checking if addressed to Claude",
+                            participant_count
+                        );
+
+                        // Get conversation history for context
+                        let history_for_check = db
+                            .get_recent_messages_for_chat(&msg.chat_guid, 10)
+                            .unwrap_or_default();
+
+                        // Build conversation string for Gemini
+                        let conversation: String = history_for_check
+                            .iter()
+                            .filter(|m| m.guid != msg.guid)
+                            .map(|m| {
+                                let sender_name = if m.is_from_me { "Claude" } else { &m.sender };
+                                format!("{}: {}", sender_name, m.text)
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n");
+
+                        match gemini_client
+                            .check_if_addressed_to_claude(&conversation, &msg.text, &msg.sender)
+                            .await
+                        {
+                            Ok(check) => {
+                                if !check.addressed_to_claude {
+                                    info!(
+                                        "Message not addressed to Claude: {}",
+                                        check.reason
+                                    );
+                                    if let Err(e) = db.mark_not_for_claude(&msg.guid, &check.reason) {
+                                        error!("Failed to mark as not_for_claude: {}", e);
+                                    }
+                                    continue; // Skip Claude invocation
+                                }
+                                debug!("Message IS addressed to Claude: {}", check.reason);
+                            }
+                            Err(e) => {
+                                // On Gemini error, default to responding (fail-open for 1:1-like behavior)
+                                warn!("Gemini addressed check failed, defaulting to respond: {}", e);
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    // On error getting participant count, default to responding
+                    warn!("Failed to get participant count, defaulting to respond: {}", e);
+                }
+            }
+        }
+
         if let Err(e) = db.update_status(&msg.guid, "processing") {
             error!("Failed to update status to processing: {}", e);
             continue;
         }
 
         // Get conversation history for context
-        let history = match db.get_recent_messages_for_chat(&msg.chat_guid, config.context.message_history_count) {
+        let history = match db.get_recent_messages_for_chat(
+            &msg.chat_guid,
+            config.context.message_history_count,
+        ) {
             Ok(v) => v,
             Err(e) => {
                 error!("Failed to get chat history: {}", e);
@@ -152,18 +355,132 @@ async fn main() -> Result<()> {
         let prompt = invoker.build_prompt(msg, &history);
 
         match invoker.invoke(&prompt, session_id.as_deref()).await {
-            Ok((response, new_session_id)) => {
-                // Send response
-                match sender.send_with_retry(&msg.chat_guid, &response, 3).await {
+            Ok(result) => {
+                // Store transcript
+                let transcript_id = {
+                    let transcript = Transcript {
+                        id: None,
+                        message_guid: msg.guid.clone(),
+                        chat_guid: msg.chat_guid.clone(),
+                        session_id: result.session_id.clone(),
+                        prompt_sent: prompt.clone(),
+                        raw_stdout: result.raw_stdout.clone(),
+                        raw_stderr: Some(result.raw_stderr.clone()),
+                        exit_code: result.exit_code,
+                        messages_json: result.messages_json.clone(),
+                        tool_calls_json: result.tool_calls_json.clone(),
+                        cost_usd: result.cost_usd,
+                        input_tokens: result.input_tokens,
+                        output_tokens: result.output_tokens,
+                        claude_model: result.model.clone(),
+                        working_dir: config
+                            .claude
+                            .working_dir
+                            .to_string_lossy()
+                            .to_string(),
+                        duration_ms: result.duration_ms,
+                        created_at: chrono::Utc::now().timestamp_millis(),
+                    };
+
+                    match transcripts_db.insert_transcript(&transcript) {
+                        Ok(id) => {
+                            debug!("Stored transcript with id {}", id);
+                            Some(id)
+                        }
+                        Err(e) => {
+                            warn!("Failed to store transcript: {}", e);
+                            None
+                        }
+                    }
+                };
+
+                // Send response first (graceful degradation - always send even if extraction fails)
+                match sender
+                    .send_with_retry(&msg.chat_guid, &result.response_text, 3)
+                    .await
+                {
                     Ok(response_guid) => {
                         if let Err(e) = db.mark_processed(
                             &msg.guid,
                             response_guid.as_deref(),
-                            new_session_id.as_deref(),
+                            result.session_id.as_deref(),
                         ) {
                             error!("Failed to mark as processed: {}", e);
                         }
                         info!("Successfully processed and responded to message");
+
+                        // Extract followups using Gemini (if configured)
+                        // DISABLED: Followup extraction is turned off to reduce noise
+                        // To re-enable, change `false` to `true` below
+                        let _followup_extraction_enabled = false;
+                        if _followup_extraction_enabled {
+                            if let (Some(ref gemini_client), Some(tid)) = (&gemini, transcript_id) {
+                                let conversation = build_conversation_for_extraction(
+                                    &history,
+                                    msg,
+                                    &result.response_text,
+                                );
+
+                                match gemini_client.extract_followups(&conversation).await {
+                                    Ok(extracted) => {
+                                        if !extracted.is_empty() {
+                                            info!(
+                                                "Extracted {} followup(s) from conversation",
+                                                extracted.len()
+                                            );
+                                        }
+
+                                        for ef in extracted {
+                                            let notify_at =
+                                                gemini_client.parse_relative_time(&ef.notify_at_relative);
+
+                                            let (notify_interval_mins, notify_until) =
+                                                if let Some(recurring) = &ef.recurring {
+                                                    let until = recurring.until_relative.as_ref().and_then(
+                                                        |u| gemini_client.parse_relative_time(u),
+                                                    );
+                                                    (Some(recurring.interval_mins), until)
+                                                } else {
+                                                    (None, None)
+                                                };
+
+                                            let followup = Followup {
+                                                id: None,
+                                                transcript_id: tid,
+                                                chat_guid: msg.chat_guid.clone(),
+                                                sender: msg.sender.clone(),
+                                                original_message_guid: msg.guid.clone(),
+                                                description: ef.description,
+                                                context_summary: Some(ef.context),
+                                                trigger_type: ef.followup_type,
+                                                notify_at,
+                                                notify_interval_mins,
+                                                notify_until,
+                                                recurrence_count: 0,
+                                                status: "pending".to_string(),
+                                                created_at: chrono::Utc::now().timestamp_millis(),
+                                                sent_at: None,
+                                                dismissed_at: None,
+                                                notification_guid: None,
+                                                user_response: None,
+                                            };
+
+                                            if let Err(e) = followups_db.insert_followup(&followup) {
+                                                warn!("Failed to insert followup: {}", e);
+                                            } else {
+                                                info!(
+                                                    "Created followup: {} (notify_at: {:?})",
+                                                    followup.description, followup.notify_at
+                                                );
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        warn!("Gemini extraction failed: {}", e);
+                                    }
+                                }
+                            }
+                        }
                     }
                     Err(e) => {
                         error!("Failed to send response: {}", e);
@@ -180,4 +497,37 @@ async fn main() -> Result<()> {
 
     info!("Sink daemon shutting down");
     Ok(())
+}
+
+/// Build a conversation string for Gemini extraction (hard cap: 10 messages)
+fn build_conversation_for_extraction(
+    history: &[crate::db::Message],
+    current_msg: &crate::db::Message,
+    claude_response: &str,
+) -> String {
+    let mut conversation = String::new();
+
+    // Take last 9 messages from history (to leave room for current + response = 10 total)
+    let history_slice = if history.len() > 9 {
+        &history[history.len() - 9..]
+    } else {
+        history
+    };
+
+    for msg in history_slice {
+        let sender = if msg.is_from_me {
+            "Claude"
+        } else {
+            &msg.sender
+        };
+        conversation.push_str(&format!("{}: {}\n\n", sender, msg.text));
+    }
+
+    // Add current message
+    conversation.push_str(&format!("{}: {}\n\n", current_msg.sender, current_msg.text));
+
+    // Add Claude's response
+    conversation.push_str(&format!("Claude: {}\n", claude_response));
+
+    conversation
 }

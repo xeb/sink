@@ -113,8 +113,10 @@ impl Poller {
                     processed_at: None,
                     response_guid: None,
                     session_id: None,
-                    status: "pending".to_string(),
+                    // Outbound messages are already "sent", inbound start as "pending"
+                    status: if m.is_from_me { "sent".to_string() } else { "pending".to_string() },
                     is_from_me: m.is_from_me,
+                    gemini_reason: None,
                 })
             })
             .collect();
@@ -150,5 +152,45 @@ impl Poller {
         }
 
         Ok(new_messages)
+    }
+
+    /// Get the number of participants in a chat (including Claude)
+    pub async fn get_chat_participant_count(&self, chat_guid: &str) -> Result<usize> {
+        let url = format!(
+            "{}/api/v1/chat/{}?password={}",
+            self.config.bluebubbles_url(),
+            urlencoding::encode(chat_guid),
+            urlencoding::encode(&self.config.bluebubbles.password)
+        );
+
+        debug!("Fetching chat info for {}", chat_guid);
+
+        let response = self
+            .client
+            .get(&url)
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            return Err(SinkError::BlueBubbles(format!(
+                "API returned status: {}",
+                response.status()
+            )));
+        }
+
+        #[derive(Debug, Deserialize)]
+        struct ChatInfo {
+            participants: Option<Vec<serde_json::Value>>,
+        }
+
+        let api_response: ApiResponse<ChatInfo> = response.json().await?;
+
+        if api_response.status != 200 {
+            return Err(SinkError::BlueBubbles(api_response.message));
+        }
+
+        let count = api_response.data.participants.map(|p| p.len()).unwrap_or(1);
+        debug!("Chat {} has {} participants", chat_guid, count);
+        Ok(count)
     }
 }

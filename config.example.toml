@@ -1,0 +1,37 @@
+# Sink Configuration Example
+# Copy to /etc/sink/config.toml and fill in your values
+
+[bluebubbles]
+host = "your-bluebubbles-host"  # Hostname or IP of BlueBubbles server
+port = 1234                      # BlueBubbles port
+password = "your-password"       # BlueBubbles password
+
+[claude]
+working_dir = "/path/to/working/directory"  # Directory Claude runs in
+binary = "/path/to/claude"                   # Path to claude CLI binary
+
+[polling]
+interval_secs = 5  # How often to poll for new messages
+
+[database]
+path = "/var/lib/sink/messages.db"
+
+[context]
+message_history_count = 10  # Number of previous messages to include as context
+
+# Optional: For group chat filtering
+# If not set, all group chat messages will be processed
+[gemini]
+api_key = ""  # Or set GEMINI_API_KEY environment variable
+model = "gemini-2.0-flash"
+
+# Optional: Proactive notifications (currently disabled by default)
+[notifications]
+enabled = false
+scheduler_interval_secs = 60
+
+# Optional: Web admin panel
+[web_server]
+enabled = true
+port = 1111
+host = "0.0.0.0"  # Use 127.0.0.1 to restrict to localhost

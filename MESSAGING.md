@@ -78,7 +78,7 @@ ssh xeb@your-bluebubbles-host 'curl -s -X POST "http://localhost:1234/api/v1/mes
 | Elaine | +1XXXXXXXXXX | — |
 | Joey | +1XXXXXXXXXX | — |
 | Alex | +1XXXXXXXXXX | — |
-| Dylan | — | contact@example.com |
+| Dylan | +1XXXXXXXXXX | contact@example.com |
 
 ---
 
@@ -97,6 +97,8 @@ ssh xeb@your-bluebubbles-host 'curl -s -X POST "http://localhost:1234/api/v1/mes
 |---------|--------------|-------------|
 | chat71220438889027713 | Elaine, Paul, Brooke | Life group leaders |
 | chat3627499118798467 | Elaine, Alex, Joey | Weekenders |
+| chat512208582762136128 | Joey, Mark | PTW retreat coordination (Claude's account) |
+| chat92063741243803962 | Mark, Elaine | Family planning (Claude's account) |
 
 ---
 
