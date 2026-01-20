@@ -1,4 +1,4 @@
-# Sink
+# 🚰 Sink
 
 A Rust daemon that bridges iMessage (via BlueBubbles) with Claude Code. When someone texts Claude's iMessage account, this daemon processes the message through Claude and sends back the response.
 
