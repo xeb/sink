@@ -1,5 +1,7 @@
 # 🚰 Sink
 
+> **Requires [BlueBubbles](https://bluebubbles.app/) running on a Mac with iMessage access**
+
 A Rust daemon that bridges iMessage (via BlueBubbles) with Claude Code. When someone texts Claude's iMessage account, this daemon processes the message through Claude and sends back the response.
 
 ## Features
