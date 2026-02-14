@@ -14,6 +14,7 @@ Environment=SINK_CONFIG=/etc/sink/config.toml
 Environment=RUST_LOG=sink=info
 Environment=PATH=/path/to/node/bin:/usr/local/bin:/usr/bin:/bin
 Environment=HOME=/home/youruser
+# Let Claude Code use its OAuth authentication (no ANTHROPIC_API_KEY)
 
 # Logging
 StandardOutput=journal
