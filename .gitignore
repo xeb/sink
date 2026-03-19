@@ -19,3 +19,10 @@ Thumbs.db
 
 # Logs
 *.log
+
+# Secrets and local config
+secrets.toml
+config/sink.toml
+MESSAGING.md
+filter-expressions.txt
+fix.sh

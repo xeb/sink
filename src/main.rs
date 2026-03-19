@@ -1,3 +1,4 @@
+mod attachments;
 mod claude;
 mod commands;
 mod config;
@@ -11,10 +12,11 @@ mod sender;
 mod transcripts;
 mod web;
 
+use crate::attachments::AttachmentDownloader;
 use crate::claude::ClaudeInvoker;
 use crate::commands::{CommandHandler, CommandParser};
 use crate::config::Config;
-use crate::db::Database;
+use crate::db::{Database, Message};
 use crate::error::Result;
 use crate::followups::{Followup, FollowupsDb};
 use crate::gemini::GeminiExtractor;
@@ -114,6 +116,7 @@ async fn main() -> Result<()> {
     let poller = Poller::new(config.clone());
     let invoker = ClaudeInvoker::new(config.clone());
     let sender = Sender::new(config.clone());
+    let attachment_downloader = AttachmentDownloader::new(config.clone());
 
     // Set up signal handling for graceful shutdown
     let running = Arc::new(AtomicBool::new(true));
@@ -226,8 +229,63 @@ async fn main() -> Result<()> {
             continue;
         }
 
-        // Process the oldest pending message
-        let msg = &pending[0];
+        // Check if the batch window has elapsed for this chat
+        // (wait until no new messages have arrived for batch_window_secs)
+        let oldest_pending = &pending[0];
+        let batch_window_ms = (config.polling.batch_window_secs * 1000) as i64;
+        let now_ms = chrono::Utc::now().timestamp_millis();
+
+        let newest_ts = match db.newest_pending_timestamp_for_chat(&oldest_pending.chat_guid) {
+            Ok(Some(ts)) => ts,
+            Ok(None) => continue,
+            Err(e) => {
+                error!("Database error checking batch window: {}", e);
+                continue;
+            }
+        };
+
+        if now_ms - newest_ts < batch_window_ms {
+            debug!(
+                "Batch window not elapsed for chat {} ({:.1}s remaining)",
+                oldest_pending.chat_guid,
+                (batch_window_ms - (now_ms - newest_ts)) as f64 / 1000.0
+            );
+            continue;
+        }
+
+        // Batch all pending messages from this chat
+        let batch = match db.get_pending_messages_for_chat(&oldest_pending.chat_guid) {
+            Ok(v) => v,
+            Err(e) => {
+                error!("Database error getting batch: {}", e);
+                continue;
+            }
+        };
+
+        // Build a combined message from the batch
+        let msg = if batch.len() == 1 {
+            batch[0].clone()
+        } else {
+            info!("Batching {} messages from chat {}", batch.len(), batch[0].chat_guid);
+            let combined_text = batch
+                .iter()
+                .map(|m| m.text.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            let combined_attachments = batch
+                .iter()
+                .flat_map(|m| m.attachments.clone())
+                .collect::<Vec<_>>();
+            Message {
+                text: combined_text,
+                attachments: combined_attachments,
+                // Use the first message's metadata (guid, sender, etc.)
+                ..batch[0].clone()
+            }
+        };
+        // Track all guids in the batch for marking status later
+        let batch_guids: Vec<String> = batch.iter().map(|m| m.guid.clone()).collect();
+
         info!(
             "Processing message from {} in {}",
             msg.sender, msg.chat_guid
@@ -249,13 +307,17 @@ async fn main() -> Result<()> {
                     if let Err(e) = sender.send_with_retry(&msg.chat_guid, &response, 3).await {
                         error!("Failed to send command response: {}", e);
                     }
-                    if let Err(e) = db.mark_processed(&msg.guid, None, None) {
-                        error!("Failed to mark command as processed: {}", e);
+                    for guid in &batch_guids {
+                        if let Err(e) = db.mark_processed(guid, None, None) {
+                            error!("Failed to mark command as processed: {}", e);
+                        }
                     }
                 }
                 Err(e) => {
                     error!("Command handler error: {}", e);
-                    let _ = db.mark_failed(&msg.guid);
+                    for guid in &batch_guids {
+                        let _ = db.mark_failed(guid);
+                    }
                 }
             }
             continue; // Skip Claude invocation for commands
@@ -297,8 +359,10 @@ async fn main() -> Result<()> {
                                         "Message not addressed to Claude: {}",
                                         check.reason
                                     );
-                                    if let Err(e) = db.mark_not_for_claude(&msg.guid, &check.reason) {
-                                        error!("Failed to mark as not_for_claude: {}", e);
+                                    for guid in &batch_guids {
+                                        if let Err(e) = db.mark_not_for_claude(guid, &check.reason) {
+                                            error!("Failed to mark as not_for_claude: {}", e);
+                                        }
                                     }
                                     continue; // Skip Claude invocation
                                 }
@@ -318,9 +382,10 @@ async fn main() -> Result<()> {
             }
         }
 
-        if let Err(e) = db.update_status(&msg.guid, "processing") {
-            error!("Failed to update status to processing: {}", e);
-            continue;
+        for guid in &batch_guids {
+            if let Err(e) = db.update_status(guid, "processing") {
+                error!("Failed to update status to processing: {}", e);
+            }
         }
 
         // Get conversation history for context
@@ -331,15 +396,17 @@ async fn main() -> Result<()> {
             Ok(v) => v,
             Err(e) => {
                 error!("Failed to get chat history: {}", e);
-                let _ = db.mark_failed(&msg.guid);
+                for guid in &batch_guids {
+                    let _ = db.mark_failed(guid);
+                }
                 continue;
             }
         };
 
-        // Filter out the current message from history
+        // Filter out the batched messages from history
         let history: Vec<_> = history
             .into_iter()
-            .filter(|m| m.guid != msg.guid)
+            .filter(|m| !batch_guids.contains(&m.guid))
             .collect();
 
         // Get existing session for this chat
@@ -351,8 +418,18 @@ async fn main() -> Result<()> {
             }
         };
 
+        // Download attachments if present
+        let attachment_paths = if !msg.attachments.is_empty() {
+            info!("Downloading {} attachment(s)", msg.attachments.len());
+            attachment_downloader
+                .download_all(&msg.attachments, &msg.guid)
+                .await
+        } else {
+            Vec::new()
+        };
+
         // Build prompt and invoke Claude
-        let prompt = invoker.build_prompt(msg, &history);
+        let prompt = invoker.build_prompt(&msg, &history, &attachment_paths);
 
         match invoker.invoke(&prompt, session_id.as_deref()).await {
             Ok(result) => {
@@ -400,12 +477,14 @@ async fn main() -> Result<()> {
                     .await
                 {
                     Ok(response_guid) => {
-                        if let Err(e) = db.mark_processed(
-                            &msg.guid,
-                            response_guid.as_deref(),
-                            result.session_id.as_deref(),
-                        ) {
-                            error!("Failed to mark as processed: {}", e);
+                        for guid in &batch_guids {
+                            if let Err(e) = db.mark_processed(
+                                guid,
+                                response_guid.as_deref(),
+                                result.session_id.as_deref(),
+                            ) {
+                                error!("Failed to mark as processed: {}", e);
+                            }
                         }
                         info!("Successfully processed and responded to message");
 
@@ -417,7 +496,7 @@ async fn main() -> Result<()> {
                             if let (Some(ref gemini_client), Some(tid)) = (&gemini, transcript_id) {
                                 let conversation = build_conversation_for_extraction(
                                     &history,
-                                    msg,
+                                    &msg,
                                     &result.response_text,
                                 );
 
@@ -484,13 +563,17 @@ async fn main() -> Result<()> {
                     }
                     Err(e) => {
                         error!("Failed to send response: {}", e);
-                        let _ = db.mark_failed(&msg.guid);
+                        for guid in &batch_guids {
+                            let _ = db.mark_failed(guid);
+                        }
                     }
                 }
             }
             Err(e) => {
                 error!("Claude invocation failed: {}", e);
-                let _ = db.mark_failed(&msg.guid);
+                for guid in &batch_guids {
+                    let _ = db.mark_failed(guid);
+                }
             }
         }
     }

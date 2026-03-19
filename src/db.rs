@@ -1,4 +1,5 @@
 use crate::error::Result;
+use crate::poller::Attachment;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 use std::path::Path;
@@ -18,6 +19,8 @@ pub struct Message {
     pub status: String,
     pub is_from_me: bool,
     pub gemini_reason: Option<String>,
+    #[serde(skip)]
+    pub attachments: Vec<Attachment>,
 }
 
 pub struct Database {
@@ -135,6 +138,7 @@ impl Database {
                     status: row.get(9)?,
                     is_from_me: row.get::<_, i32>(10)? != 0,
                     gemini_reason: row.get(11)?,
+                    attachments: Vec::new(),
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -169,6 +173,7 @@ impl Database {
                     status: row.get(9)?,
                     is_from_me: row.get::<_, i32>(10)? != 0,
                     gemini_reason: row.get(11)?,
+                    attachments: Vec::new(),
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -240,6 +245,54 @@ impl Database {
             params![now, reason, guid],
         )?;
         Ok(())
+    }
+
+    /// Get all pending messages for a specific chat, ordered chronologically
+    pub fn get_pending_messages_for_chat(&self, chat_guid: &str) -> Result<Vec<Message>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT id, guid, chat_guid, sender, text, date_received,
+                   processed_at, response_guid, session_id, status, is_from_me, gemini_reason
+            FROM messages
+            WHERE status = 'pending' AND is_from_me = 0 AND chat_guid = ?
+            ORDER BY date_received ASC
+            "#,
+        )?;
+
+        let messages = stmt
+            .query_map(params![chat_guid], |row| {
+                Ok(Message {
+                    id: Some(row.get(0)?),
+                    guid: row.get(1)?,
+                    chat_guid: row.get(2)?,
+                    sender: row.get(3)?,
+                    text: row.get(4)?,
+                    date_received: row.get(5)?,
+                    processed_at: row.get(6)?,
+                    response_guid: row.get(7)?,
+                    session_id: row.get(8)?,
+                    status: row.get(9)?,
+                    is_from_me: row.get::<_, i32>(10)? != 0,
+                    gemini_reason: row.get(11)?,
+                    attachments: Vec::new(),
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+
+        Ok(messages)
+    }
+
+    /// Get the newest pending message timestamp for a chat
+    pub fn newest_pending_timestamp_for_chat(&self, chat_guid: &str) -> Result<Option<i64>> {
+        let ts: Option<i64> = self.conn.query_row(
+            r#"
+            SELECT MAX(date_received) FROM messages
+            WHERE status = 'pending' AND is_from_me = 0 AND chat_guid = ?
+            "#,
+            [chat_guid],
+            |row| row.get(0),
+        ).optional()?.flatten();
+        Ok(ts)
     }
 
     /// Recover any messages stuck in "processing" status (e.g., after a crash)

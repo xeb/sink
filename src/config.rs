@@ -35,6 +35,12 @@ pub struct ClaudeConfig {
 #[derive(Debug, Deserialize, Clone)]
 pub struct PollingConfig {
     pub interval_secs: u64,
+    #[serde(default = "default_batch_window")]
+    pub batch_window_secs: u64,
+}
+
+fn default_batch_window() -> u64 {
+    30
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -162,22 +168,23 @@ impl Default for Config {
     fn default() -> Self {
         Config {
             bluebubbles: BlueBubblesConfig {
-                host: "your-bluebubbles-host".to_string(),
-                port: 1235,
-                password: "CHANGEME_PASSWORD".to_string(),
+                host: "localhost".to_string(),
+                port: 1234,
+                password: "changeme".to_string(),
             },
             claude: ClaudeConfig {
-                working_dir: PathBuf::from("/path/to/working/directory"),
+                working_dir: PathBuf::from("."),
                 binary: "claude".to_string(),
             },
             polling: PollingConfig {
                 interval_secs: 5,
+                batch_window_secs: 30,
             },
             database: DatabaseConfig {
                 path: PathBuf::from("/var/lib/sink/messages.db"),
             },
             context: ContextConfig {
-                message_history_count: 10,
+                message_history_count: 20,
             },
             databases: None,
             gemini: None,

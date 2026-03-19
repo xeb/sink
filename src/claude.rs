@@ -3,7 +3,7 @@ use crate::db::Message;
 use crate::error::{Result, SinkError};
 use chrono::{TimeZone, Utc};
 use std::process::Stdio;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::process::Command;
 use tracing::{debug, error, info};
 
@@ -32,7 +32,12 @@ impl ClaudeInvoker {
         ClaudeInvoker { config }
     }
 
-    pub fn build_prompt(&self, current_message: &Message, history: &[Message]) -> String {
+    pub fn build_prompt(
+        &self,
+        current_message: &Message,
+        history: &[Message],
+        attachment_paths: &[String],
+    ) -> String {
         let mut prompt = String::new();
 
         // System instructions
@@ -40,7 +45,20 @@ impl ClaudeInvoker {
         prompt.push_str("YOU ARE A NESTED AGENT. You are Claude, an assistant responding via iMessage.\n\n");
         prompt.push_str("- NEVER use tools to send messages, texts, or notifications. The system handles all message delivery automatically.\n");
         prompt.push_str("- Just provide your text response to help with whatever the user asks.\n");
-        prompt.push_str("- Focus on research, answers, and assistance based on the user's request.\n\n");
+        prompt.push_str("- Focus on research, answers, and assistance based on the user's request.\n");
+        prompt.push_str("- Keep responses concise and suitable for iMessage (not too long).\n\n");
+
+        prompt.push_str("[FULL MESSAGE HISTORY ACCESS]\n\n");
+        prompt.push_str("The recent conversation is shown below, but you can access the FULL message history for any chat using sqlite3.\n");
+        prompt.push_str("Database: /var/lib/sink/messages.db\n");
+        prompt.push_str("Table: messages (id, guid, chat_guid, sender, text, date_received, status, is_from_me)\n");
+        prompt.push_str("Example queries:\n");
+        prompt.push_str(&format!(
+            "  sqlite3 /var/lib/sink/messages.db \"SELECT sender, text, datetime(date_received/1000, 'unixepoch') as time FROM messages WHERE chat_guid='{}' ORDER BY date_received DESC LIMIT 50;\"\n",
+            current_message.chat_guid
+        ));
+        prompt.push_str("  sqlite3 /var/lib/sink/messages.db \"SELECT COUNT(*) FROM messages WHERE chat_guid='...';\"\n");
+        prompt.push_str("Use this when you need more context than what's provided below, e.g. if the user references something from earlier in the conversation.\n\n");
 
         if !history.is_empty() {
             prompt.push_str("[Previous messages in this conversation]\n\n");
@@ -75,6 +93,14 @@ impl ClaudeInvoker {
             current_message.sender, timestamp, current_message.text
         ));
 
+        // Add attachment file paths if present
+        if !attachment_paths.is_empty() {
+            prompt.push_str("\n\n[Attachments sent with this message - use the Read tool to view these files]\n");
+            for path in attachment_paths {
+                prompt.push_str(&format!("- {}\n", path));
+            }
+        }
+
         prompt
     }
 
@@ -85,6 +111,58 @@ impl ClaudeInvoker {
     ) -> Result<ClaudeResult> {
         let start = Instant::now();
 
+        let (output, _) = self.run_claude(prompt, session_id).await?;
+        let duration_ms = start.elapsed().as_millis() as i64;
+
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let stderr_str = String::from_utf8_lossy(&output.stderr).to_string();
+        let exit_code = output.status.code().unwrap_or(-1);
+
+        if !output.status.success() {
+            // If resume failed due to stale session, retry without it
+            if session_id.is_some() && stderr_str.contains("No conversation found with session ID") {
+                info!("Session expired, retrying without --resume");
+                let (output2, _) = self.run_claude(prompt, None).await?;
+                let retry_duration = start.elapsed().as_millis() as i64;
+
+                let stdout2 = String::from_utf8_lossy(&output2.stdout).to_string();
+                let stderr2 = String::from_utf8_lossy(&output2.stderr).to_string();
+                let exit_code2 = output2.status.code().unwrap_or(-1);
+
+                if !output2.status.success() {
+                    error!("Claude retry failed with status {}: {}", output2.status, stderr2);
+                    return Err(SinkError::Claude(format!(
+                        "Process exited with status {}: {}",
+                        output2.status, stderr2
+                    )));
+                }
+
+                let result = self.parse_output(&stdout2, &stderr2, exit_code2, retry_duration)?;
+                info!("Claude response length: {} chars (after session retry)", result.response_text.len());
+                return Ok(result);
+            }
+
+            error!("Claude failed with status {}: {}", output.status, stderr_str);
+            return Err(SinkError::Claude(format!(
+                "Process exited with status {}: {}",
+                output.status, stderr_str
+            )));
+        }
+
+        debug!("Claude output length: {} chars", stdout.len());
+
+        // Parse JSON output to extract all fields
+        let result = self.parse_output(&stdout, &stderr_str, exit_code, duration_ms)?;
+
+        info!("Claude response length: {} chars", result.response_text.len());
+        Ok(result)
+    }
+
+    async fn run_claude(
+        &self,
+        prompt: &str,
+        session_id: Option<&str>,
+    ) -> Result<(std::process::Output, String)> {
         let mut cmd = Command::new(&self.config.claude.binary);
 
         cmd.arg("-p")
@@ -102,31 +180,27 @@ impl ClaudeInvoker {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
-        info!("Invoking Claude in {:?}", self.config.claude.working_dir);
+        info!("Invoking Claude in {:?} (session: {:?})", self.config.claude.working_dir, session_id);
         debug!("Prompt length: {} chars", prompt.len());
 
-        let output = cmd.output().await?;
-        let duration_ms = start.elapsed().as_millis() as i64;
+        let timeout_duration = Duration::from_secs(30 * 60); // 30 minute hard limit
+        let child = cmd.spawn()?;
+        let pid = child.id();
 
-        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-        let exit_code = output.status.code().unwrap_or(-1);
-
-        if !output.status.success() {
-            error!("Claude failed with status {}: {}", output.status, stderr);
-            return Err(SinkError::Claude(format!(
-                "Process exited with status {}: {}",
-                output.status, stderr
-            )));
+        match tokio::time::timeout(timeout_duration, child.wait_with_output()).await {
+            Ok(result) => {
+                let output = result?;
+                let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+                Ok((output, stderr))
+            }
+            Err(_) => {
+                error!("Claude process timed out after 30 minutes, killing pid {:?}", pid);
+                if let Some(pid) = pid {
+                    let _ = std::process::Command::new("kill").arg("-9").arg(pid.to_string()).output();
+                }
+                Err(SinkError::Claude("Process timed out after 30 minutes".to_string()))
+            }
         }
-
-        debug!("Claude output length: {} chars", stdout.len());
-
-        // Parse JSON output to extract all fields
-        let result = self.parse_output(&stdout, &stderr, exit_code, duration_ms)?;
-
-        info!("Claude response length: {} chars", result.response_text.len());
-        Ok(result)
     }
 
     fn parse_output(

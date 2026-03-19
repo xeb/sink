@@ -5,14 +5,17 @@ A Rust daemon that bridges iMessage (via BlueBubbles) with Claude Code. When som
 ## Quick Reference
 
 ```bash
-make install    # First-time install (builds, installs, enables service)
-make update     # Rebuild and restart after code changes
-make uninstall  # Remove service (preserves data)
-make status     # Check service status
-make logs       # Tail service logs
-make restart    # Restart service
-make stop       # Stop service
-make start      # Start service
+# Build and update (no sudo required)
+cargo build --release
+cp target/release/sink ~/.local/bin/sink
+systemctl --user restart sink
+
+# Service control (no sudo required)
+systemctl --user status sink     # Check status
+systemctl --user restart sink    # Restart
+systemctl --user stop sink       # Stop
+systemctl --user start sink      # Start
+journalctl --user -u sink -f     # Tail logs
 ```
 
 ## Architecture
@@ -46,11 +49,15 @@ BlueBubbles Server
 
 - **Only processes new messages**: Messages received before daemon startup are marked "skipped"
 - **Sequential processing**: One message at a time; new messages queue in SQLite
-- **Context aware**: Last 10 messages in conversation passed to Claude as context
+- **Message batching**: Waits 30s for additional messages before processing (handles iOS message splitting)
+- **Context aware**: Last 20 messages in conversation passed to Claude as context
+- **Full history access**: Claude can query the SQLite database for complete conversation history
 - **Session continuity**: Uses `--resume` to maintain Claude's memory per chat
 - **Group chat filtering**: Uses Gemini to detect if messages in group chats are directed at Claude
+- **Image handling**: Downloads attachments to `/tmp/sink/`, converts HEIC to JPG, passes paths to Claude
 - **Proactive notifications**: Extracts follow-ups from conversations and sends reminder texts
 - **Threaded replies**: Notifications are sent as replies to the original message
+- **30-minute timeout**: Claude processes are killed after 30 minutes to prevent hangs
 
 ## Group Chat Behavior
 
@@ -94,48 +101,16 @@ Users can control notifications via text commands:
 
 | Path | Purpose |
 |------|---------|
-| `/usr/local/bin/sink` | Installed binary |
-| `/etc/sink/config.toml` | Configuration (owned by xeb, mode 600) |
+| `~/.local/bin/sink` | Installed binary |
+| `~/.config/systemd/user/sink.service` | User systemd unit |
+| `/etc/sink/config.toml` | Configuration (mode 600) |
 | `/var/lib/sink/messages.db` | Messages database |
 | `/var/lib/sink/transcripts.db` | Full Claude session transcripts |
 | `/var/lib/sink/followups.db` | Pending notifications & user preferences |
-| `/etc/systemd/system/sink.service` | Systemd unit |
 
 ## Configuration
 
-```toml
-# /etc/sink/config.toml
-[bluebubbles]
-host = "your-bluebubbles-host"
-port = 1234
-password = "your-password"
-
-[claude]
-working_dir = "/path/to/working/directory"
-binary = "/path/to/claude"
-
-[polling]
-interval_secs = 5
-
-[database]
-path = "/var/lib/sink/messages.db"
-
-[context]
-message_history_count = 10
-
-[gemini]
-api_key = "..."  # Or set GEMINI_API_KEY env var
-model = "gemini-2.0-flash"
-
-[notifications]
-enabled = false
-scheduler_interval_secs = 60
-
-[web_server]
-enabled = true
-port = 1111
-host = "0.0.0.0"
-```
+See `config.example.toml` for all options. Copy to `/etc/sink/config.toml` and fill in your values.
 
 ## Database Schemas
 
@@ -224,7 +199,7 @@ src/
 ├── main.rs        # Daemon loop, message processing, integration
 ├── config.rs      # TOML config loading
 ├── db.rs          # Messages database operations
-├── poller.rs      # BlueBubbles API polling + participant count
+├── poller.rs      # BlueBubbles API polling + participant count + attachments
 ├── claude.rs      # Claude CLI invocation
 ├── sender.rs      # Response sending (regular + threaded replies)
 ├── error.rs       # Error types
@@ -233,6 +208,7 @@ src/
 ├── followups.rs   # Followups database + user preferences
 ├── scheduler.rs   # Background notification scheduler
 ├── commands.rs    # User command parsing + handling
+├── attachments.rs # Image/attachment downloading + HEIC conversion
 └── web.rs         # Web admin panel (axum server)
 ```
 
@@ -251,10 +227,10 @@ Access at `http://localhost:1111` or configure reverse proxy with auth.
 
 ```bash
 # Check service status
-systemctl status sink
+systemctl --user status sink
 
 # Tail logs
-journalctl -u sink -f
+journalctl --user -u sink -f
 
 # Query messages
 sqlite3 /var/lib/sink/messages.db "SELECT * FROM messages ORDER BY date_received DESC LIMIT 10;"
@@ -276,8 +252,9 @@ curl -s "http://YOUR_BLUEBUBBLES_HOST:PORT/api/v1/server/info?password=YOUR_PASS
 
 | Issue | Solution |
 |-------|----------|
-| Permission denied on config | `sudo chown youruser:youruser /etc/sink/config.toml` |
-| Node not found | Ensure PATH in sink.service includes nvm node path |
+| Permission denied on config | `sudo chown $USER:$USER /etc/sink/config.toml` |
+| Node not found | Ensure PATH in service file includes path to node/claude binary |
 | Historical messages processing | Fixed; daemon only processes messages after startup |
 | Claude responds to group chat side conversations | Check Gemini API key is set; verify with logs |
 | Double messages from followups | Fixed; scheduler tells Claude not to send messages directly |
+| Message stuck in "processing" | Check `journalctl --user -u sink -f` for errors; reset with `sqlite3 /var/lib/sink/messages.db "UPDATE messages SET status='pending' WHERE status='processing'"` |

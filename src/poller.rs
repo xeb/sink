@@ -11,6 +11,22 @@ struct ApiResponse<T> {
     data: T,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct Attachment {
+    pub guid: String,
+    #[serde(rename = "mimeType")]
+    pub mime_type: Option<String>,
+    pub uti: Option<String>,
+    #[serde(rename = "transferName")]
+    pub transfer_name: Option<String>,
+    #[serde(rename = "totalBytes")]
+    pub total_bytes: Option<i64>,
+    #[serde(rename = "isOutgoing")]
+    pub is_outgoing: Option<bool>,
+    #[serde(rename = "hasLivePhoto")]
+    pub has_live_photo: Option<bool>,
+}
+
 #[derive(Debug, Deserialize)]
 struct BlueBubblesMessage {
     guid: String,
@@ -21,6 +37,8 @@ struct BlueBubblesMessage {
     date_created: i64,
     chats: Vec<Chat>,
     handle: Option<Handle>,
+    #[serde(default)]
+    attachments: Vec<Attachment>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -63,7 +81,7 @@ impl Poller {
         let request = QueryRequest {
             limit,
             sort: "DESC".to_string(),
-            with: vec!["chat".to_string(), "handle".to_string()],
+            with: vec!["chat".to_string(), "handle".to_string(), "attachment".to_string()],
         };
 
         debug!("Fetching {} recent messages from BlueBubbles", limit);
@@ -92,8 +110,10 @@ impl Poller {
             .data
             .into_iter()
             .filter_map(|m| {
-                let text = m.text?;
-                if text.is_empty() {
+                // Allow messages with text OR attachments (or both)
+                let has_content = m.text.as_ref().map(|t| !t.is_empty()).unwrap_or(false)
+                    || !m.attachments.is_empty();
+                if !has_content {
                     return None;
                 }
 
@@ -108,7 +128,7 @@ impl Poller {
                     guid: m.guid,
                     chat_guid,
                     sender,
-                    text,
+                    text: m.text.unwrap_or_default(),
                     date_received: m.date_created,
                     processed_at: None,
                     response_guid: None,
@@ -117,6 +137,7 @@ impl Poller {
                     status: if m.is_from_me { "sent".to_string() } else { "pending".to_string() },
                     is_from_me: m.is_from_me,
                     gemini_reason: None,
+                    attachments: m.attachments,
                 })
             })
             .collect();

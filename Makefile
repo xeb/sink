@@ -13,12 +13,12 @@ install: build
 	@echo "Installing $(BINARY_NAME)..."
 	sudo mkdir -p $(CONFIG_DIR)
 	sudo mkdir -p $(DATA_DIR)
-	sudo chown youruser:youruser $(DATA_DIR)
+	sudo chown $$USER:$$USER $(DATA_DIR)
 	sudo cp target/release/$(BINARY_NAME) $(INSTALL_PATH)
 	sudo chmod 755 $(INSTALL_PATH)
 	@if [ ! -f $(CONFIG_DIR)/config.toml ]; then \
-		sudo cp config/sink.toml $(CONFIG_DIR)/config.toml; \
-		sudo chown youruser:youruser $(CONFIG_DIR)/config.toml; \
+		sudo cp config.example.toml $(CONFIG_DIR)/config.toml; \
+		sudo chown $$USER:$$USER $(CONFIG_DIR)/config.toml; \
 		sudo chmod 600 $(CONFIG_DIR)/config.toml; \
 		echo "Installed default config to $(CONFIG_DIR)/config.toml"; \
 	else \

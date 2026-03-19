@@ -318,6 +318,7 @@ async fn list_messages(
                     status: row.get(9)?,
                     is_from_me: row.get::<_, i32>(10)? != 0,
                     gemini_reason: row.get(11)?,
+                    attachments: Vec::new(),
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -371,6 +372,7 @@ async fn get_message(
                     status: row.get(9)?,
                     is_from_me: row.get::<_, i32>(10)? != 0,
                     gemini_reason: row.get(11)?,
+                    attachments: Vec::new(),
                 })
             },
         ).optional()?;

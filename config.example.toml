@@ -11,13 +11,14 @@ working_dir = "/path/to/working/directory"  # Directory Claude runs in
 binary = "/path/to/claude"                   # Path to claude CLI binary
 
 [polling]
-interval_secs = 5  # How often to poll for new messages
+interval_secs = 5              # How often to poll for new messages
+batch_window_secs = 30         # Wait this long for additional messages before processing
 
 [database]
 path = "/var/lib/sink/messages.db"
 
 [context]
-message_history_count = 10  # Number of previous messages to include as context
+message_history_count = 20  # Number of previous messages to include as context
 
 # Optional: For group chat filtering
 # If not set, all group chat messages will be processed
@@ -25,7 +26,7 @@ message_history_count = 10  # Number of previous messages to include as context
 api_key = ""  # Or set GEMINI_API_KEY environment variable
 model = "gemini-2.0-flash"
 
-# Optional: Proactive notifications (currently disabled by default)
+# Optional: Proactive notifications
 [notifications]
 enabled = false
 scheduler_interval_secs = 60

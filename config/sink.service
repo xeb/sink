@@ -7,14 +7,14 @@ Type=simple
 ExecStart=/usr/local/bin/sink
 Restart=always
 RestartSec=10
-User=youruser
-Group=youruser
-WorkingDirectory=/path/to/working/directory
+# Update these for your system:
+# User=youruser
+# Group=yourgroup
+# WorkingDirectory=/path/to/claude/working/dir
 Environment=SINK_CONFIG=/etc/sink/config.toml
 Environment=RUST_LOG=sink=info
-Environment=PATH=/path/to/node/bin:/usr/local/bin:/usr/bin:/bin
-Environment=HOME=/home/youruser
-# Let Claude Code use its OAuth authentication (no ANTHROPIC_API_KEY)
+# Environment=PATH=/path/to/node/bin:/usr/local/bin:/usr/bin:/bin
+# Environment=HOME=/home/youruser
 
 # Logging
 StandardOutput=journal
