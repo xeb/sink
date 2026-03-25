@@ -658,9 +658,32 @@ async fn main() -> Result<()> {
                 }
             }
             Err(e) => {
-                error!("Claude invocation failed: {}", e);
-                for guid in &batch_guids {
-                    let _ = db.mark_failed(guid);
+                error!("Command execution failed: {}", e);
+
+                // Send error response to user
+                let error_response = format!("⚠️ Error processing command: {}", e);
+                match sender
+                    .send_with_retry(&msg.chat_guid, &error_response, 3)
+                    .await
+                {
+                    Ok(response_guid) => {
+                        info!("Sent error response to user");
+                        for guid in &batch_guids {
+                            if let Err(err) = db.mark_processed(
+                                guid,
+                                response_guid.as_deref(),
+                                None,
+                            ) {
+                                error!("Failed to mark as processed: {}", err);
+                            }
+                        }
+                    }
+                    Err(send_err) => {
+                        error!("Failed to send error response: {}", send_err);
+                        for guid in &batch_guids {
+                            let _ = db.mark_failed(guid);
+                        }
+                    }
                 }
             }
         }
