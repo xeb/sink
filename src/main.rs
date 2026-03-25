@@ -456,13 +456,36 @@ async fn main() -> Result<()> {
 
         // Execute command via tmux or Claude depending on configuration
         let execution_result = if use_tmux {
-            // TMUX MODE: Send message text directly to Claude Code interactive session
+            // TMUX MODE: Wrap message with unique ID and extract matching [REPLY-ID] from output
             if let Some(ref tc) = tmux_config {
                 debug!("Using TMUX mode for message: {}", msg.text);
-                match crate::tmux::execute_command(tc, &msg.text).await {
+
+                // Generate a 4-character random ID to uniquely identify this command/reply pair
+                let id = uuid::Uuid::new_v4().to_string()[0..4].to_string();
+
+                let wrapped = format!("[CMD-{}]{}[/CMD-{}]", id, msg.text, id);
+                info!("TMUX: Sending wrapped command with ID: {}", id);
+
+                match crate::tmux::execute_command(tc, &wrapped).await {
                     Ok(output) => {
-                        info!("TMUX command completed, output length: {}", output.len());
-                        Ok((output, None)) // (response_text, session_id)
+                        info!("TMUX: Raw output received, {} chars", output.len());
+                        // Extract content between [REPLY-ID] and [/REPLY-ID] tags for this specific command
+                        let reply_start_tag = format!("[REPLY-{}]", id);
+                        let reply_end_tag = format!("[/REPLY-{}]", id);
+
+                        if let Some(start) = output.find(&reply_start_tag) {
+                            if let Some(end) = output[start..].find(&reply_end_tag) {
+                                let reply_content = output[start + reply_start_tag.len()..start + end].to_string();
+                                info!("TMUX: Extracted reply for ID {}: {} chars", id, reply_content.len());
+                                Ok((reply_content, None))
+                            } else {
+                                error!("TMUX: Found [REPLY-{}] but no [/REPLY-{}] tag", id, id);
+                                Err(format!("Response missing [/REPLY-{}] tag", id))
+                            }
+                        } else {
+                            error!("TMUX: No [REPLY-{}] tag found in output", id);
+                            Err(format!("Response missing [REPLY-{}] tags", id))
+                        }
                     }
                     Err(e) => {
                         error!("TMUX command failed: {}", e);
@@ -503,6 +526,7 @@ async fn main() -> Result<()> {
 
         match execution_result {
             Ok((response_text, session_id_opt)) => {
+                info!("Message execution succeeded, response: {} chars", response_text.len());
                 // Store/track transcript (varies by mode)
                 let transcript_id: Option<i64> = if !use_tmux {
                     // Store transcript only in Claude mode
@@ -546,6 +570,7 @@ async fn main() -> Result<()> {
                 };
 
                 // Send response
+                info!("Sending response via iMessage: {} chars", response_text.len());
                 match sender
                     .send_with_retry(&msg.chat_guid, &response_text, 3)
                     .await

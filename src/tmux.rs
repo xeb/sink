@@ -2,7 +2,7 @@ use regex::Regex;
 use std::process::Command;
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
-use tracing::{debug, error};
+use tracing::{debug, error, info};
 
 #[derive(Debug, Clone)]
 pub struct TmuxConfig {
@@ -30,23 +30,39 @@ impl Default for TmuxConfig {
 /// Send a command to tmux window and wait for Claude to finish processing
 pub async fn execute_command(config: &TmuxConfig, command_text: &str) -> Result<String, String> {
     debug!("Sending command to {}:{}: {}", config.session, config.window, command_text);
+    info!("TMUX: Starting command execution in {}:{}", config.session, config.window);
 
     let target = format!("{}:{}", config.session, config.window);
 
     // Step 1: Send command as literal text
+    info!("TMUX: Sending literal text: {}", command_text);
     send_keys_literal(&target, command_text)?;
+    info!("TMUX: Literal text sent successfully");
 
     // Step 2: Send Enter key
+    info!("TMUX: Sending Enter key");
     send_keys_key(&target, "Enter")?;
+    info!("TMUX: Enter key sent, waiting for prompt");
 
-    // Step 3: Wait for prompt (poll until prompt appears without thinking indicator)
-    let result = wait_for_prompt(config, &target).await?;
+    // Step 3: Wait for [REPLY-ID] tags (Claude wraps response with matching ID)
+    // Extract the ID from the command text (format: [CMD-XXXX]...[/CMD-XXXX])
+    let cmd_id = if let Some(start) = command_text.find("[CMD-") {
+        if let Some(end) = command_text[start + 5..].find("]") {
+            command_text[start + 5..start + 5 + end].to_string()
+        } else {
+            return Err("Invalid command format".to_string());
+        }
+    } else {
+        return Err("Command missing [CMD-ID] format".to_string());
+    };
 
-    // Step 4: Extract meaningful output
-    let output = extract_output(&result, command_text, &config.prompt)?;
+    info!("TMUX: Waiting for [REPLY-{}] tags (timeout: {}s, poll interval: {}ms)",
+        cmd_id, config.timeout_secs, config.capture_interval_ms);
+    let result = wait_for_reply_tags(&target, &cmd_id, config.timeout_secs, config.capture_interval_ms).await?;
+    info!("TMUX: [REPLY-{}] tags detected, returning output: {} chars", cmd_id, result.len());
 
-    debug!("Command completed, output length: {} chars", output.len());
-    Ok(output)
+    // Return the raw output - caller extracts [REPLY-ID]...[/REPLY-ID] content
+    Ok(result)
 }
 
 /// Send literal text to tmux window (via -l flag, prevents escape sequence interpretation)
@@ -94,6 +110,48 @@ fn capture_pane(target: &str) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
+/// Wait for [REPLY-ID] tags in the output (Claude wraps response with matching ID)
+async fn wait_for_reply_tags(target: &str, cmd_id: &str, timeout_secs: u64, poll_interval_ms: u64) -> Result<String, String> {
+    let start = Instant::now();
+    let timeout = Duration::from_secs(timeout_secs);
+    let poll_interval = Duration::from_millis(poll_interval_ms);
+
+    let reply_start_tag = format!("[REPLY-{}]", cmd_id);
+    let reply_end_tag = format!("[/REPLY-{}]", cmd_id);
+
+    let mut poll_count = 0;
+    loop {
+        poll_count += 1;
+        let content = capture_pane(target)?;
+
+        // Look for [REPLY-ID] tags (specific to this command)
+        if content.contains(&reply_start_tag) && content.contains(&reply_end_tag) {
+            info!("TMUX: Found [REPLY-{}] tags after {} polls", cmd_id, poll_count);
+            return Ok(content);
+        }
+
+        // Check timeout
+        if start.elapsed() > timeout {
+            error!(
+                "Timed out waiting for [REPLY-{}] tags after {} seconds ({} polls)",
+                cmd_id, timeout_secs, poll_count
+            );
+            return Err(format!(
+                "Timed out waiting for [REPLY-{}] tags after {} seconds",
+                cmd_id, timeout_secs
+            ));
+        }
+
+        if poll_count % 10 == 0 {
+            debug!("TMUX: Still waiting for [REPLY-{}] tags (poll #{}, elapsed: {}s)",
+                cmd_id, poll_count, start.elapsed().as_secs());
+        }
+
+        // Poll again
+        sleep(poll_interval).await;
+    }
+}
+
 /// Wait for the prompt to appear (indicating Claude finished processing)
 /// The prompt should appear without any thinking indicator below it
 async fn wait_for_prompt(config: &TmuxConfig, target: &str) -> Result<String, String> {
@@ -106,7 +164,9 @@ async fn wait_for_prompt(config: &TmuxConfig, target: &str) -> Result<String, St
     let thinking_pattern =
         Regex::new(r"^[\s]*[✻✽·⏳🔄💭🌀][^❯]*$").unwrap_or_else(|_| Regex::new("^$").unwrap());
 
+    let mut poll_count = 0;
     loop {
+        poll_count += 1;
         let content = capture_pane(target)?;
         let lines: Vec<&str> = content.lines().collect();
 
@@ -124,22 +184,30 @@ async fn wait_for_prompt(config: &TmuxConfig, target: &str) -> Result<String, St
                 .any(|line| thinking_pattern.is_match(line) && !line.contains(&config.prompt));
 
             if !has_thinking {
+                info!("TMUX: Prompt detected after {} polls, {} lines captured", poll_count, lines.len());
                 debug!("Prompt detected with no thinking indicator, command complete");
                 return Ok(content);
+            } else {
+                debug!("Prompt found but thinking indicator still present, continue polling");
+            }
+        } else {
+            if poll_count % 10 == 0 {
+                debug!("TMUX: No prompt yet (poll #{}, {} lines, elapsed: {}s)",
+                    poll_count, lines.len(), start.elapsed().as_secs());
             }
         }
 
         // Check timeout
         if start.elapsed() > timeout {
             error!(
-                "Command timed out after {} seconds waiting for prompt",
-                config.timeout_secs
+                "Command timed out after {} seconds waiting for prompt ({} polls)",
+                config.timeout_secs, poll_count
             );
             // Capture final state for debugging
             let final_capture = capture_pane(target)?;
             return Err(format!(
-                "Command timed out after {} seconds",
-                config.timeout_secs
+                "Command timed out after {} seconds (polls: {}, last capture: {} lines)",
+                config.timeout_secs, poll_count, final_capture.lines().count()
             ));
         }
 
@@ -159,8 +227,11 @@ pub fn strip_ansi_codes(text: &str) -> String {
 /// Extract meaningful output from the captured pane
 /// Removes: command echo (first line), Claude decorations, trailing prompt
 fn extract_output(raw_output: &str, command_sent: &str, prompt: &str) -> Result<String, String> {
+    info!("TMUX: Extracting output from {} chars, command was: {}", raw_output.len(), command_sent);
+
     // Strip ANSI codes first
     let clean = strip_ansi_codes(raw_output);
+    info!("TMUX: After stripping ANSI: {} chars", clean.len());
 
     let mut lines: Vec<&str> = clean.lines().collect();
 
@@ -206,6 +277,7 @@ fn extract_output(raw_output: &str, command_sent: &str, prompt: &str) -> Result<
     let result = lines.join("\n").trim().to_string();
 
     if result.is_empty() {
+        error!("TMUX: No output extracted from command response");
         return Err("No output extracted from command response".to_string());
     }
 
@@ -216,6 +288,7 @@ fn extract_output(raw_output: &str, command_sent: &str, prompt: &str) -> Result<
         .collect::<Vec<_>>()
         .join("\n");
 
+    info!("TMUX: Final extracted output: {} chars, {} lines", limited.len(), limited.lines().count());
     Ok(limited)
 }
 
