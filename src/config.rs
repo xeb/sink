@@ -17,6 +17,8 @@ pub struct Config {
     pub notifications: Option<NotificationsConfig>,
     #[serde(default)]
     pub web_server: Option<WebServerConfig>,
+    #[serde(default)]
+    pub tmux: Option<TmuxConfigSection>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -150,6 +152,46 @@ impl Default for WebServerConfig {
     }
 }
 
+#[derive(Debug, Deserialize, Clone)]
+pub struct TmuxConfigSection {
+    #[serde(default = "default_tmux_session")]
+    pub session: String,
+    #[serde(default = "default_tmux_window")]
+    pub window: String,
+    #[serde(default = "default_tmux_prompt")]
+    pub prompt: String,
+    #[serde(default = "default_tmux_timeout")]
+    pub timeout_secs: u64,
+    #[serde(default = "default_tmux_capture_lines")]
+    pub capture_lines: usize,
+    #[serde(default = "default_tmux_poll_interval")]
+    pub capture_interval_ms: u64,
+}
+
+fn default_tmux_session() -> String {
+    "main".to_string()
+}
+
+fn default_tmux_window() -> String {
+    "sink MASTER".to_string()
+}
+
+fn default_tmux_prompt() -> String {
+    "❯".to_string()
+}
+
+fn default_tmux_timeout() -> u64 {
+    90
+}
+
+fn default_tmux_capture_lines() -> usize {
+    200
+}
+
+fn default_tmux_poll_interval() -> u64 {
+    200
+}
+
 impl Config {
     pub fn load(path: &std::path::Path) -> Result<Self> {
         let content = std::fs::read_to_string(path)
@@ -190,6 +232,7 @@ impl Default for Config {
             gemini: None,
             notifications: None,
             web_server: None,
+            tmux: None,
         }
     }
 }

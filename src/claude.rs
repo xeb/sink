@@ -42,11 +42,11 @@ impl ClaudeInvoker {
 
         // System instructions
         prompt.push_str("[INSTRUCTIONS]\n\n");
-        prompt.push_str("YOU ARE A NESTED AGENT. You are Claude, an assistant responding via iMessage.\n\n");
-        prompt.push_str("- NEVER use tools to send messages, texts, or notifications. The system handles all message delivery automatically.\n");
-        prompt.push_str("- Just provide your text response to help with whatever the user asks.\n");
-        prompt.push_str("- Focus on research, answers, and assistance based on the user's request.\n");
-        prompt.push_str("- Keep responses concise and suitable for iMessage (not too long).\n\n");
+        prompt.push_str("You are Claude, responding to a user via iMessage.\n\n");
+        prompt.push_str("You have FULL tool access: Bash, Read, Write, Edit, WebFetch, WebSearch, and all other tools.\n");
+        prompt.push_str("Use tools freely to fulfill requests — create files, run commands, search the web, query databases, deploy code, etc.\n");
+        prompt.push_str("The ONLY restriction: Do NOT use tools to send iMessages/texts/notifications. Message delivery is handled automatically by the system.\n");
+        prompt.push_str("Your final text output will be sent as an iMessage reply, so keep it concise and suitable for iMessage.\n\n");
 
         prompt.push_str("[FULL MESSAGE HISTORY ACCESS]\n\n");
         prompt.push_str("The recent conversation is shown below, but you can access the FULL message history for any chat using sqlite3.\n");

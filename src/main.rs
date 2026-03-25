@@ -6,9 +6,11 @@ mod db;
 mod error;
 mod followups;
 mod gemini;
+mod gmail;
 mod poller;
 mod scheduler;
 mod sender;
+mod tmux;
 mod transcripts;
 mod web;
 
@@ -23,6 +25,7 @@ use crate::gemini::GeminiExtractor;
 use crate::poller::Poller;
 use crate::scheduler::NotificationScheduler;
 use crate::sender::Sender;
+use crate::tmux::TmuxConfig;
 use crate::transcripts::{Transcript, TranscriptsDb};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -112,6 +115,26 @@ async fn main() -> Result<()> {
         }
     });
 
+    // Determine execution mode (tmux vs Claude)
+    let use_tmux = config.tmux.is_some();
+    let tmux_config = config.tmux.as_ref().map(|t| TmuxConfig {
+        session: t.session.clone(),
+        window: t.window.clone(),
+        prompt: t.prompt.clone(),
+        timeout_secs: t.timeout_secs,
+        capture_lines: t.capture_lines,
+        capture_interval_ms: t.capture_interval_ms,
+    });
+
+    if use_tmux {
+        info!("TMUX mode enabled: {}:{}",
+            tmux_config.as_ref().map(|c| &c.session).unwrap_or(&"?".to_string()),
+            tmux_config.as_ref().map(|c| &c.window).unwrap_or(&"?".to_string())
+        );
+    } else {
+        info!("Claude mode enabled (no [tmux] config section found)");
+    }
+
     // Initialize components
     let poller = Poller::new(config.clone());
     let invoker = ClaudeInvoker::new(config.clone());
@@ -189,6 +212,8 @@ async fn main() -> Result<()> {
     );
 
     let mut poll_interval = interval(Duration::from_secs(config.polling.interval_secs));
+    let mut message_count: u64 = 0;
+    let mut gmail_auth_pending: Option<gmail::GmailAuthPending> = None;
 
     while running.load(Ordering::SeqCst) {
         poll_interval.tick().await;
@@ -290,6 +315,26 @@ async fn main() -> Result<()> {
             "Processing message from {} in {}",
             msg.sender, msg.chat_guid
         );
+
+        // Check if this is a gmail auth callback URL (intercept before anything else)
+        if gmail_auth_pending.is_some() && gmail::is_callback_url(&msg.text) {
+            info!("Received Gmail auth callback URL, completing authentication");
+            if let Some(pending) = gmail_auth_pending.take() {
+                let success = pending.complete(msg.text.trim()).await;
+                if success {
+                    info!("Gmail re-authentication succeeded");
+                } else {
+                    warn!("Gmail re-authentication failed");
+                }
+            }
+            // Swallow the message silently
+            for guid in &batch_guids {
+                if let Err(e) = db.mark_processed(guid, None, None) {
+                    error!("Failed to mark gmail callback as processed: {}", e);
+                }
+            }
+            continue;
+        }
 
         // Check if this is a control command (before Claude invocation)
         if let Some(command) = CommandParser::parse(&msg.text) {
@@ -409,53 +454,79 @@ async fn main() -> Result<()> {
             .filter(|m| !batch_guids.contains(&m.guid))
             .collect();
 
-        // Get existing session for this chat
-        let session_id = match db.get_session_for_chat(&msg.chat_guid) {
-            Ok(v) => v,
-            Err(e) => {
-                error!("Failed to get session: {}", e);
-                None
+        // Execute command via tmux or Claude depending on configuration
+        let execution_result = if use_tmux {
+            // TMUX MODE: Send message text directly to Claude Code interactive session
+            if let Some(ref tc) = tmux_config {
+                debug!("Using TMUX mode for message: {}", msg.text);
+                match crate::tmux::execute_command(tc, &msg.text).await {
+                    Ok(output) => {
+                        info!("TMUX command completed, output length: {}", output.len());
+                        Ok((output, None)) // (response_text, session_id)
+                    }
+                    Err(e) => {
+                        error!("TMUX command failed: {}", e);
+                        Err(format!("TMUX execution error: {}", e))
+                    }
+                }
+            } else {
+                Err("TMUX mode enabled but config missing".to_string())
+            }
+        } else {
+            // CLAUDE MODE: Traditional subprocess invocation
+            let session_id = match db.get_session_for_chat(&msg.chat_guid) {
+                Ok(v) => v,
+                Err(e) => {
+                    error!("Failed to get session: {}", e);
+                    None
+                }
+            };
+
+            // Download attachments if present
+            let attachment_paths = if !msg.attachments.is_empty() {
+                info!("Downloading {} attachment(s)", msg.attachments.len());
+                attachment_downloader
+                    .download_all(&msg.attachments, &msg.guid)
+                    .await
+            } else {
+                Vec::new()
+            };
+
+            // Build prompt and invoke Claude
+            let prompt = invoker.build_prompt(&msg, &history, &attachment_paths);
+
+            match invoker.invoke(&prompt, session_id.as_deref()).await {
+                Ok(result) => Ok((result.response_text, result.session_id)),
+                Err(e) => Err(e.to_string()),
             }
         };
 
-        // Download attachments if present
-        let attachment_paths = if !msg.attachments.is_empty() {
-            info!("Downloading {} attachment(s)", msg.attachments.len());
-            attachment_downloader
-                .download_all(&msg.attachments, &msg.guid)
-                .await
-        } else {
-            Vec::new()
-        };
-
-        // Build prompt and invoke Claude
-        let prompt = invoker.build_prompt(&msg, &history, &attachment_paths);
-
-        match invoker.invoke(&prompt, session_id.as_deref()).await {
-            Ok(result) => {
-                // Store transcript
-                let transcript_id = {
+        match execution_result {
+            Ok((response_text, session_id_opt)) => {
+                // Store/track transcript (varies by mode)
+                let transcript_id: Option<i64> = if !use_tmux {
+                    // Store transcript only in Claude mode
                     let transcript = Transcript {
                         id: None,
                         message_guid: msg.guid.clone(),
                         chat_guid: msg.chat_guid.clone(),
-                        session_id: result.session_id.clone(),
-                        prompt_sent: prompt.clone(),
-                        raw_stdout: result.raw_stdout.clone(),
-                        raw_stderr: Some(result.raw_stderr.clone()),
-                        exit_code: result.exit_code,
-                        messages_json: result.messages_json.clone(),
-                        tool_calls_json: result.tool_calls_json.clone(),
-                        cost_usd: result.cost_usd,
-                        input_tokens: result.input_tokens,
-                        output_tokens: result.output_tokens,
-                        claude_model: result.model.clone(),
+                        session_id: session_id_opt.clone(),
+                        prompt_sent: String::new(), // Would be filled from Claude result in full mode
+                        raw_stdout: String::new(),
+                        raw_stderr: None,
+                        exit_code: 0,
+                        messages_json: None,
+                        tool_calls_json: None,
+                        cost_usd: None,
+                        input_tokens: None,
+                        output_tokens: None,
+                        claude_model: None,
                         working_dir: config
                             .claude
                             .working_dir
                             .to_string_lossy()
                             .to_string(),
-                        duration_ms: result.duration_ms,
+                        duration_ms: 0,
                         created_at: chrono::Utc::now().timestamp_millis(),
                     };
 
@@ -469,11 +540,14 @@ async fn main() -> Result<()> {
                             None
                         }
                     }
+                } else {
+                    // TMUX mode: no transcript storage
+                    None
                 };
 
-                // Send response first (graceful degradation - always send even if extraction fails)
+                // Send response
                 match sender
-                    .send_with_retry(&msg.chat_guid, &result.response_text, 3)
+                    .send_with_retry(&msg.chat_guid, &response_text, 3)
                     .await
                 {
                     Ok(response_guid) => {
@@ -481,12 +555,26 @@ async fn main() -> Result<()> {
                             if let Err(e) = db.mark_processed(
                                 guid,
                                 response_guid.as_deref(),
-                                result.session_id.as_deref(),
+                                session_id_opt.as_deref(),
                             ) {
                                 error!("Failed to mark as processed: {}", e);
                             }
                         }
                         info!("Successfully processed and responded to message");
+                        message_count += 1;
+
+                        // Every 4th message, check gmail auth (if not already pending)
+                        if gmail::should_check(message_count) && gmail_auth_pending.is_none() {
+                            info!("Checking Gmail authentication (message #{})", message_count);
+                            if !gmail::check_auth().await {
+                                info!("Gmail not authenticated, starting login flow");
+                                if let Some((auth_url, pending)) = gmail::start_login().await {
+                                    gmail::send_auth_request(&sender, &auth_url).await;
+                                    gmail_auth_pending = Some(pending);
+                                    info!("Gmail auth URL sent to Mark, waiting for callback");
+                                }
+                            }
+                        }
 
                         // Extract followups using Gemini (if configured)
                         // DISABLED: Followup extraction is turned off to reduce noise
@@ -497,7 +585,7 @@ async fn main() -> Result<()> {
                                 let conversation = build_conversation_for_extraction(
                                     &history,
                                     &msg,
-                                    &result.response_text,
+                                    &response_text,
                                 );
 
                                 match gemini_client.extract_followups(&conversation).await {
