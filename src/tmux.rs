@@ -34,6 +34,15 @@ pub async fn execute_command(config: &TmuxConfig, command_text: &str) -> Result<
 
     let target = format!("{}:{}", config.session, config.window);
 
+    // Step 0: Check if permission menu is open and dismiss it
+    let content = capture_pane(&target)?;
+    if content.contains("bypass permissions") {
+        info!("TMUX: Detected permissions menu, dismissing with Tab");
+        send_keys_key(&target, "Tab")?;
+        // Wait a moment for the menu to process
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+
     // Step 1: Send command as literal text
     info!("TMUX: Sending literal text: {}", command_text);
     send_keys_literal(&target, command_text)?;
