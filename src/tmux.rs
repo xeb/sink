@@ -6,7 +6,6 @@ use tracing::{debug, error, info};
 
 #[derive(Debug, Clone)]
 pub struct TmuxConfig {
-    pub session: String,           // Session name (e.g., "main")
     pub window: String,            // Window name (e.g., "sink MASTER")
     pub prompt: String,            // Prompt string (e.g., "❯")
     pub timeout_secs: u64,         // Max wait time (default: 90)
@@ -17,7 +16,6 @@ pub struct TmuxConfig {
 impl Default for TmuxConfig {
     fn default() -> Self {
         TmuxConfig {
-            session: "main".to_string(),
             window: "sink MASTER".to_string(),
             prompt: "❯".to_string(),
             timeout_secs: 90,
@@ -27,12 +25,34 @@ impl Default for TmuxConfig {
     }
 }
 
+/// Find the tmux target (session:window) by searching all sessions for the named window
+fn find_target(window_name: &str) -> Result<String, String> {
+    let output = Command::new("tmux")
+        .args(&["list-windows", "-a", "-F", "#{session_name}:#{window_name}"])
+        .output()
+        .map_err(|e| format!("Failed to list tmux windows: {}", e))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("tmux list-windows failed: {}", stderr));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.lines() {
+        if let Some((_session, window)) = line.split_once(':') {
+            if window == window_name {
+                return Ok(line.to_string());
+            }
+        }
+    }
+
+    Err(format!("No tmux window named '{}' found", window_name))
+}
+
 /// Send a command to tmux window and wait for Claude to finish processing
 pub async fn execute_command(config: &TmuxConfig, command_text: &str) -> Result<String, String> {
-    debug!("Sending command to {}:{}: {}", config.session, config.window, command_text);
-    info!("TMUX: Starting command execution in {}:{}", config.session, config.window);
-
-    let target = format!("{}:{}", config.session, config.window);
+    let target = find_target(&config.window)?;
+    info!("TMUX: Starting command execution in {}", target);
 
     // Step 0: Check if permission menu is open and dismiss it
     let content = capture_pane(&target)?;

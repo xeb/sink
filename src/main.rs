@@ -118,7 +118,6 @@ async fn main() -> Result<()> {
     // Determine execution mode (tmux vs Claude)
     let use_tmux = config.tmux.is_some();
     let tmux_config = config.tmux.as_ref().map(|t| TmuxConfig {
-        session: t.session.clone(),
         window: t.window.clone(),
         prompt: t.prompt.clone(),
         timeout_secs: t.timeout_secs,
@@ -127,9 +126,8 @@ async fn main() -> Result<()> {
     });
 
     if use_tmux {
-        info!("TMUX mode enabled: {}:{}",
-            tmux_config.as_ref().map(|c| &c.session).unwrap_or(&"?".to_string()),
-            tmux_config.as_ref().map(|c| &c.window).unwrap_or(&"?".to_string())
+        info!("TMUX mode enabled, window: {}",
+            tmux_config.as_ref().map(|c| c.window.as_str()).unwrap_or("?")
         );
     } else {
         info!("Claude mode enabled (no [tmux] config section found)");

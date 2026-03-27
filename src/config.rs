@@ -154,8 +154,6 @@ impl Default for WebServerConfig {
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct TmuxConfigSection {
-    #[serde(default = "default_tmux_session")]
-    pub session: String,
     #[serde(default = "default_tmux_window")]
     pub window: String,
     #[serde(default = "default_tmux_prompt")]
@@ -166,10 +164,6 @@ pub struct TmuxConfigSection {
     pub capture_lines: usize,
     #[serde(default = "default_tmux_poll_interval")]
     pub capture_interval_ms: u64,
-}
-
-fn default_tmux_session() -> String {
-    "main".to_string()
 }
 
 fn default_tmux_window() -> String {
