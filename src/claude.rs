@@ -1,7 +1,7 @@
 use crate::config::Config;
 use crate::db::Message;
 use crate::error::{Result, SinkError};
-use chrono::{TimeZone, Utc};
+use chrono::{Local, TimeZone, Utc};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 use tokio::process::Command;
@@ -54,7 +54,7 @@ impl ClaudeInvoker {
         prompt.push_str("Table: messages (id, guid, chat_guid, sender, text, date_received, status, is_from_me)\n");
         prompt.push_str("Example queries:\n");
         prompt.push_str(&format!(
-            "  sqlite3 /var/lib/sink/messages.db \"SELECT sender, text, datetime(date_received/1000, 'unixepoch') as time FROM messages WHERE chat_guid='{}' ORDER BY date_received DESC LIMIT 50;\"\n",
+            "  sqlite3 /var/lib/sink/messages.db \"SELECT sender, text, datetime(date_received/1000, 'unixepoch', 'localtime') as time FROM messages WHERE chat_guid='{}' ORDER BY date_received DESC LIMIT 50;\"\n",
             current_message.chat_guid
         ));
         prompt.push_str("  sqlite3 /var/lib/sink/messages.db \"SELECT COUNT(*) FROM messages WHERE chat_guid='...';\"\n");
@@ -67,7 +67,7 @@ impl ClaudeInvoker {
                 let timestamp = Utc
                     .timestamp_millis_opt(msg.date_received)
                     .single()
-                    .map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string())
+                    .map(|t| t.with_timezone(&Local).format("%Y-%m-%d %H:%M:%S %Z").to_string())
                     .unwrap_or_else(|| "unknown time".to_string());
 
                 let sender = if msg.is_from_me {
@@ -85,7 +85,7 @@ impl ClaudeInvoker {
         let timestamp = Utc
             .timestamp_millis_opt(current_message.date_received)
             .single()
-            .map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string())
+            .map(|t| t.with_timezone(&Local).format("%Y-%m-%d %H:%M:%S %Z").to_string())
             .unwrap_or_else(|| "unknown time".to_string());
 
         prompt.push_str(&format!(
@@ -95,7 +95,9 @@ impl ClaudeInvoker {
 
         // Add attachment file paths if present
         if !attachment_paths.is_empty() {
-            prompt.push_str("\n\n[Attachments sent with this message - use the Read tool to view these files]\n");
+            prompt.push_str("\n\n[ATTACHMENTS - MANDATORY ACTION REQUIRED]\n");
+            prompt.push_str("The user sent image/file attachment(s) with this message. You MUST use the Read tool to view EACH file below BEFORE composing your response. These are local files on disk that Read can display visually.\n");
+            prompt.push_str("DO NOT ask the user to share a screenshot or link — the images are already here:\n");
             for path in attachment_paths {
                 prompt.push_str(&format!("- {}\n", path));
             }
@@ -183,7 +185,7 @@ impl ClaudeInvoker {
         info!("Invoking Claude in {:?} (session: {:?})", self.config.claude.working_dir, session_id);
         debug!("Prompt length: {} chars", prompt.len());
 
-        let timeout_duration = Duration::from_secs(30 * 60); // 30 minute hard limit
+        let timeout_duration = Duration::from_secs(60 * 60); // 60 minute hard limit
         let child = cmd.spawn()?;
         let pid = child.id();
 
@@ -194,11 +196,11 @@ impl ClaudeInvoker {
                 Ok((output, stderr))
             }
             Err(_) => {
-                error!("Claude process timed out after 30 minutes, killing pid {:?}", pid);
+                error!("Claude process timed out after 60 minutes, killing pid {:?}", pid);
                 if let Some(pid) = pid {
                     let _ = std::process::Command::new("kill").arg("-9").arg(pid.to_string()).output();
                 }
-                Err(SinkError::Claude("Process timed out after 30 minutes".to_string()))
+                Err(SinkError::Claude("Process timed out after 60 minutes".to_string()))
             }
         }
     }

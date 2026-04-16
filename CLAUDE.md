@@ -57,7 +57,7 @@ BlueBubbles Server
 - **Image handling**: Downloads attachments to `/tmp/sink/`, converts HEIC to JPG, passes paths to Claude
 - **Proactive notifications**: Extracts follow-ups from conversations and sends reminder texts
 - **Threaded replies**: Notifications are sent as replies to the original message
-- **30-minute timeout**: Claude processes are killed after 30 minutes to prevent hangs
+- **60-minute timeout**: Claude processes are killed after 60 minutes to prevent hangs
 
 ## Group Chat Behavior
 
