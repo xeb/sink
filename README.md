@@ -61,7 +61,7 @@ First, set up the interactive Claude Code session that Sink will use:
 tmux new-session -s main -n "sink MASTER"
 
 # In the tmux window, start Claude Code
-claude -p "You are Claude, an AI assistant for Mark."
+claude -p "You are Claude, an AI assistant."
 ```
 
 Keep this window open—it's where Sink will inject commands.
@@ -69,7 +69,7 @@ Keep this window open—it's where Sink will inject commands.
 ### 2. Clone and Build Sink
 
 ```bash
-git clone https://github.com/yourusername/sink.git
+git clone https://github.com/xeb/sink.git
 cd sink
 cargo build --release
 ```

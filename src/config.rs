@@ -19,6 +19,8 @@ pub struct Config {
     pub web_server: Option<WebServerConfig>,
     #[serde(default)]
     pub tmux: Option<TmuxConfigSection>,
+    #[serde(default)]
+    pub gmail: Option<GmailConfig>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -142,6 +144,18 @@ fn default_web_host() -> String {
     "0.0.0.0".to_string()
 }
 
+#[derive(Debug, Deserialize, Clone)]
+pub struct GmailConfig {
+    pub account: String,
+    pub owner_chat_guid: String,
+    #[serde(default = "default_gmail_cli")]
+    pub cli_path: String,
+}
+
+fn default_gmail_cli() -> String {
+    "/usr/local/bin/gmail-cli".to_string()
+}
+
 impl Default for WebServerConfig {
     fn default() -> Self {
         WebServerConfig {
@@ -227,6 +241,7 @@ impl Default for Config {
             notifications: None,
             web_server: None,
             tmux: None,
+            gmail: None,
         }
     }
 }

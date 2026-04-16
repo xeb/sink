@@ -36,3 +36,9 @@ scheduler_interval_secs = 60
 enabled = true
 port = 1111
 host = "0.0.0.0"  # Use 127.0.0.1 to restrict to localhost
+
+# Optional: Gmail integration (for email-related features)
+# [gmail]
+# account = "you@gmail.com"           # Gmail account to manage
+# owner_chat_guid = "iMessage;-;+15551234567"  # iMessage chat GUID to send auth prompts to
+# cli_path = "/usr/local/bin/gmail-cli"        # Path to gmail-cli binary

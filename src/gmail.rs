@@ -1,3 +1,4 @@
+use crate::config::GmailConfig;
 use crate::error::Result;
 use crate::sender::Sender;
 use std::process::Stdio;
@@ -5,9 +6,6 @@ use tokio::io::AsyncWriteExt;
 use tokio::process::{Child, Command};
 use tracing::{error, info, warn};
 
-const GMAIL_CLI: &str = "/home/xeb/.local/bin/gmail-cli";
-const GMAIL_ACCOUNT: &str = "xebxeb@gmail.com";
-const MARK_CHAT_GUID: &str = "iMessage;-;+14802822064";
 const CHECK_EVERY_N: u64 = 4;
 
 /// Holds a pending gmail-cli login subprocess waiting for the auth callback URL
@@ -79,9 +77,9 @@ pub fn is_callback_url(text: &str) -> bool {
 
 /// Run `gmail-cli status` to check if authenticated.
 /// Returns true if authenticated, false otherwise.
-pub async fn check_auth() -> bool {
-    match Command::new(GMAIL_CLI)
-        .args(["status", "--account", GMAIL_ACCOUNT])
+pub async fn check_auth(cfg: &GmailConfig) -> bool {
+    match Command::new(&cfg.cli_path)
+        .args(["status", "--account", &cfg.account])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
@@ -107,9 +105,9 @@ pub async fn check_auth() -> bool {
 
 /// Start the gmail-cli login process and extract the auth URL.
 /// Returns the auth URL and the pending child process, or None on failure.
-pub async fn start_login() -> Option<(String, GmailAuthPending)> {
-    let mut child = match Command::new(GMAIL_CLI)
-        .args(["login", "--account", GMAIL_ACCOUNT])
+pub async fn start_login(cfg: &GmailConfig) -> Option<(String, GmailAuthPending)> {
+    let mut child = match Command::new(&cfg.cli_path)
+        .args(["login", "--account", &cfg.account])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -171,22 +169,17 @@ pub async fn start_login() -> Option<(String, GmailAuthPending)> {
     }
 }
 
-/// Send the auth URL and a request to re-authenticate to Mark
-pub async fn send_auth_request(sender: &Sender, auth_url: &str) {
-    // Send the re-auth request message first
-    if let Err(e) = sender
-        .send_with_retry(
-            MARK_CHAT_GUID,
-            "Gmail authentication has expired for xebxeb@gmail.com. Please re-authenticate by clicking the link below, then text back the localhost URL it redirects to.",
-            3,
-        )
-        .await
-    {
-        error!("Failed to send gmail auth request to Mark: {}", e);
+/// Send the auth URL and a request to re-authenticate to the owner
+pub async fn send_auth_request(sender: &Sender, cfg: &GmailConfig, auth_url: &str) {
+    let msg = format!(
+        "Gmail authentication has expired for {}. Please re-authenticate by clicking the link below, then text back the localhost URL it redirects to.",
+        cfg.account
+    );
+    if let Err(e) = sender.send_with_retry(&cfg.owner_chat_guid, &msg, 3).await {
+        error!("Failed to send gmail auth request: {}", e);
     }
 
-    // Send the URL as a separate message
-    if let Err(e) = sender.send_with_retry(MARK_CHAT_GUID, auth_url, 3).await {
-        error!("Failed to send gmail auth URL to Mark: {}", e);
+    if let Err(e) = sender.send_with_retry(&cfg.owner_chat_guid, auth_url, 3).await {
+        error!("Failed to send gmail auth URL: {}", e);
     }
 }

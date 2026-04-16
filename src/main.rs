@@ -588,13 +588,15 @@ async fn main() -> Result<()> {
 
                         // Every 4th message, check gmail auth (if not already pending)
                         if gmail::should_check(message_count) && gmail_auth_pending.is_none() {
-                            info!("Checking Gmail authentication (message #{})", message_count);
-                            if !gmail::check_auth().await {
-                                info!("Gmail not authenticated, starting login flow");
-                                if let Some((auth_url, pending)) = gmail::start_login().await {
-                                    gmail::send_auth_request(&sender, &auth_url).await;
-                                    gmail_auth_pending = Some(pending);
-                                    info!("Gmail auth URL sent to Mark, waiting for callback");
+                            if let Some(ref gmail_cfg) = config.gmail {
+                                info!("Checking Gmail authentication (message #{})", message_count);
+                                if !gmail::check_auth(gmail_cfg).await {
+                                    info!("Gmail not authenticated, starting login flow");
+                                    if let Some((auth_url, pending)) = gmail::start_login(gmail_cfg).await {
+                                        gmail::send_auth_request(&sender, gmail_cfg, &auth_url).await;
+                                        gmail_auth_pending = Some(pending);
+                                        info!("Gmail auth URL sent, waiting for callback");
+                                    }
                                 }
                             }
                         }
