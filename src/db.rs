@@ -61,7 +61,8 @@ impl Database {
                 session_id TEXT,
                 status TEXT DEFAULT 'pending',
                 is_from_me INTEGER NOT NULL DEFAULT 0,
-                gemini_reason TEXT
+                gemini_reason TEXT,
+                attachments_json TEXT
             );
 
             CREATE INDEX IF NOT EXISTS idx_messages_chat_guid ON messages(chat_guid);
@@ -80,6 +81,16 @@ impl Database {
             self.conn.execute("ALTER TABLE messages ADD COLUMN gemini_reason TEXT", [])?;
         }
 
+        // Migration: add attachments_json column if it doesn't exist
+        let has_attachments_json: bool = self.conn.query_row(
+            "SELECT COUNT(*) > 0 FROM pragma_table_info('messages') WHERE name = 'attachments_json'",
+            [],
+            |row| row.get(0),
+        )?;
+        if !has_attachments_json {
+            self.conn.execute("ALTER TABLE messages ADD COLUMN attachments_json TEXT", [])?;
+        }
+
         Ok(())
     }
 
@@ -93,11 +104,16 @@ impl Database {
     }
 
     pub fn insert_message(&self, msg: &Message) -> Result<i64> {
+        let attachments_json = if msg.attachments.is_empty() {
+            None
+        } else {
+            serde_json::to_string(&msg.attachments).ok()
+        };
         self.conn.execute(
             r#"
             INSERT OR IGNORE INTO messages
-                (guid, chat_guid, sender, text, date_received, status, is_from_me)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                (guid, chat_guid, sender, text, date_received, status, is_from_me, attachments_json)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
             "#,
             params![
                 msg.guid,
@@ -107,6 +123,7 @@ impl Database {
                 msg.date_received,
                 msg.status,
                 msg.is_from_me as i32,
+                attachments_json,
             ],
         )?;
         Ok(self.conn.last_insert_rowid())
@@ -116,7 +133,7 @@ impl Database {
         let mut stmt = self.conn.prepare(
             r#"
             SELECT id, guid, chat_guid, sender, text, date_received,
-                   processed_at, response_guid, session_id, status, is_from_me, gemini_reason
+                   processed_at, response_guid, session_id, status, is_from_me, gemini_reason, attachments_json
             FROM messages
             WHERE status = 'pending' AND is_from_me = 0
             ORDER BY date_received ASC
@@ -138,7 +155,10 @@ impl Database {
                     status: row.get(9)?,
                     is_from_me: row.get::<_, i32>(10)? != 0,
                     gemini_reason: row.get(11)?,
-                    attachments: Vec::new(),
+                    attachments: row
+                        .get::<_, Option<String>>(12)?
+                        .and_then(|s| serde_json::from_str(&s).ok())
+                        .unwrap_or_default(),
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -150,7 +170,7 @@ impl Database {
         let mut stmt = self.conn.prepare(
             r#"
             SELECT id, guid, chat_guid, sender, text, date_received,
-                   processed_at, response_guid, session_id, status, is_from_me, gemini_reason
+                   processed_at, response_guid, session_id, status, is_from_me, gemini_reason, attachments_json
             FROM messages
             WHERE chat_guid = ?
             ORDER BY date_received DESC
@@ -173,7 +193,10 @@ impl Database {
                     status: row.get(9)?,
                     is_from_me: row.get::<_, i32>(10)? != 0,
                     gemini_reason: row.get(11)?,
-                    attachments: Vec::new(),
+                    attachments: row
+                        .get::<_, Option<String>>(12)?
+                        .and_then(|s| serde_json::from_str(&s).ok())
+                        .unwrap_or_default(),
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -252,7 +275,7 @@ impl Database {
         let mut stmt = self.conn.prepare(
             r#"
             SELECT id, guid, chat_guid, sender, text, date_received,
-                   processed_at, response_guid, session_id, status, is_from_me, gemini_reason
+                   processed_at, response_guid, session_id, status, is_from_me, gemini_reason, attachments_json
             FROM messages
             WHERE status = 'pending' AND is_from_me = 0 AND chat_guid = ?
             ORDER BY date_received ASC
@@ -274,7 +297,10 @@ impl Database {
                     status: row.get(9)?,
                     is_from_me: row.get::<_, i32>(10)? != 0,
                     gemini_reason: row.get(11)?,
-                    attachments: Vec::new(),
+                    attachments: row
+                        .get::<_, Option<String>>(12)?
+                        .and_then(|s| serde_json::from_str(&s).ok())
+                        .unwrap_or_default(),
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;

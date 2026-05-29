@@ -54,6 +54,13 @@ pub async fn execute_command(config: &TmuxConfig, command_text: &str) -> Result<
     let target = find_target(&config.window)?;
     info!("TMUX: Starting command execution in {}", target);
 
+    // Step -1: Send 3 Enters with 100ms pause to prepare prompt
+    info!("TMUX: Sending 3 Enter keys to prepare prompt");
+    for _ in 0..3 {
+        send_keys_key(&target, "Enter")?;
+        sleep(Duration::from_millis(100)).await;
+    }
+
     // Step 0: Check if permission menu is open and dismiss it
     let content = capture_pane(&target)?;
     if content.contains("bypass permissions") {
@@ -68,10 +75,13 @@ pub async fn execute_command(config: &TmuxConfig, command_text: &str) -> Result<
     send_keys_literal(&target, command_text)?;
     info!("TMUX: Literal text sent successfully");
 
-    // Step 2: Send Enter key
-    info!("TMUX: Sending Enter key");
-    send_keys_key(&target, "Enter")?;
-    info!("TMUX: Enter key sent, waiting for prompt");
+    // Step 2: Send Enter key 3 times to ensure submission
+    info!("TMUX: Sending Enter key 3 times to submit");
+    for _ in 0..3 {
+        send_keys_key(&target, "Enter")?;
+        sleep(Duration::from_millis(100)).await;
+    }
+    info!("TMUX: Enter keys sent, waiting for prompt");
 
     // Step 3: Wait for [REPLY-ID] tags (Claude wraps response with matching ID)
     // Extract the ID from the command text (format: [CMD-XXXX]...[/CMD-XXXX])

@@ -27,11 +27,38 @@ use crate::scheduler::NotificationScheduler;
 use crate::sender::Sender;
 use crate::tmux::TmuxConfig;
 use crate::transcripts::{Transcript, TranscriptsDb};
+use regex::Regex;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::time::{interval, Duration};
 use tracing::{debug, error, info, warn};
+
+/// True if an attachment is viewable media (image/video) worth downloading and
+/// handing to Claude. Skips link-preview payloads (.pluginPayloadAttachment),
+/// vcards, and other non-media attachment types.
+fn is_media_attachment(a: &poller::Attachment) -> bool {
+    if let Some(mime) = a.mime_type.as_deref() {
+        return mime.starts_with("image/") || mime.starts_with("video/");
+    }
+    // Fall back to the transfer filename extension when mime type is absent.
+    if let Some(name) = a.transfer_name.as_deref() {
+        let lower = name.to_ascii_lowercase();
+        return [
+            ".jpg", ".jpeg", ".png", ".gif", ".heic", ".heif", ".webp", ".mov", ".mp4",
+        ]
+        .iter()
+        .any(|ext| lower.ends_with(ext));
+    }
+    false
+}
+
+/// Extract the first http(s) URL from message text, if any. Used to surface a
+/// `link=` field for blank/link-only messages so the session can fetch it.
+fn extract_first_url(text: &str) -> Option<String> {
+    let re = Regex::new(r"https?://[^\s]+").ok()?;
+    re.find(text).map(|m| m.as_str().to_string())
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -452,6 +479,29 @@ async fn main() -> Result<()> {
             .filter(|m| !batch_guids.contains(&m.guid))
             .collect();
 
+        // Download media attachments (images/videos) — BOTH tmux and Claude modes need
+        // these. Non-media payloads (e.g. link-preview .pluginPayloadAttachment) are skipped
+        // so the session is never handed a non-image to Read.
+        let attachment_paths = if msg.attachments.is_empty() {
+            Vec::new()
+        } else {
+            let media: Vec<_> = msg
+                .attachments
+                .iter()
+                .filter(|a| is_media_attachment(a))
+                .cloned()
+                .collect();
+            if media.is_empty() {
+                Vec::new()
+            } else {
+                info!("Downloading {} media attachment(s)", media.len());
+                attachment_downloader.download_all(&media, &msg.guid).await
+            }
+        };
+
+        // Surface the first URL in the message text (covers blank/link-only messages).
+        let link = extract_first_url(&msg.text);
+
         // Execute command via tmux or Claude depending on configuration
         let execution_result = if use_tmux {
             // TMUX MODE: Wrap message with unique ID and extract matching [REPLY-ID] from output
@@ -461,8 +511,20 @@ async fn main() -> Result<()> {
                 // Generate a 4-character random ID to uniquely identify this command/reply pair
                 let id = uuid::Uuid::new_v4().to_string()[0..4].to_string();
 
-                let wrapped = format!("[CMD-{}]{}[/CMD-{}]", id, msg.text, id);
-                info!("TMUX: Sending wrapped command with ID: {}", id);
+                // Daemon metadata goes as bracketed tokens AFTER the pristine [CMD-id]
+                // opening tag (and before the user text), so id extraction — the first ']'
+                // following "[CMD-" — is unaffected. from= is always present; attachment=
+                // (paths joined by '|') and link= appear only when relevant.
+                let mut meta = format!("[from={}]", msg.sender);
+                if !attachment_paths.is_empty() {
+                    meta.push_str(&format!("[attachment={}]", attachment_paths.join("|")));
+                }
+                if let Some(ref url) = link {
+                    meta.push_str(&format!("[link={}]", url));
+                }
+                let wrapped = format!("[CMD-{}]{}{}[/CMD-{}]", id, meta, msg.text, id);
+                info!("TMUX: Sending wrapped command with ID: {} (from={}, {} attachment(s), link={})",
+                    id, msg.sender, attachment_paths.len(), link.is_some());
 
                 match crate::tmux::execute_command(tc, &wrapped).await {
                     Ok(output) => {
@@ -503,17 +565,7 @@ async fn main() -> Result<()> {
                 }
             };
 
-            // Download attachments if present
-            let attachment_paths = if !msg.attachments.is_empty() {
-                info!("Downloading {} attachment(s)", msg.attachments.len());
-                attachment_downloader
-                    .download_all(&msg.attachments, &msg.guid)
-                    .await
-            } else {
-                Vec::new()
-            };
-
-            // Build prompt and invoke Claude
+            // Build prompt and invoke Claude (attachments already downloaded above).
             let prompt = invoker.build_prompt(&msg, &history, &attachment_paths);
 
             match invoker.invoke(&prompt, session_id.as_deref()).await {

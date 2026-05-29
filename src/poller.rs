@@ -11,7 +11,7 @@ struct ApiResponse<T> {
     data: T,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Attachment {
     pub guid: String,
     #[serde(rename = "mimeType")]
