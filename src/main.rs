@@ -2,6 +2,7 @@ mod attachments;
 mod claude;
 mod commands;
 mod config;
+mod contacts;
 mod db;
 mod error;
 mod followups;
@@ -18,6 +19,7 @@ use crate::attachments::AttachmentDownloader;
 use crate::claude::ClaudeInvoker;
 use crate::commands::{CommandHandler, CommandParser};
 use crate::config::Config;
+use crate::contacts::ContactResolver;
 use crate::db::{Database, Message};
 use crate::error::Result;
 use crate::followups::{Followup, FollowupsDb};
@@ -165,6 +167,10 @@ async fn main() -> Result<()> {
     let invoker = ClaudeInvoker::new(config.clone());
     let sender = Sender::new(config.clone());
     let attachment_downloader = AttachmentDownloader::new(config.clone());
+    let contact_resolver = ContactResolver::new(&config);
+    if contact_resolver.enabled() {
+        info!("Contact name resolution enabled");
+    }
 
     // Set up signal handling for graceful shutdown
     let running = Arc::new(AtomicBool::new(true));
@@ -502,6 +508,10 @@ async fn main() -> Result<()> {
         // Surface the first URL in the message text (covers blank/link-only messages).
         let link = extract_first_url(&msg.text);
 
+        // Resolve the sender handle to a contact display name (read-only, via the
+        // contacts instance). Cached in-memory across messages.
+        let from_name = contact_resolver.resolve(&msg.sender).await;
+
         // Execute command via tmux or Claude depending on configuration
         let execution_result = if use_tmux {
             // TMUX MODE: Wrap message with unique ID and extract matching [REPLY-ID] from output
@@ -516,6 +526,9 @@ async fn main() -> Result<()> {
                 // following "[CMD-" — is unaffected. from= is always present; attachment=
                 // (paths joined by '|') and link= appear only when relevant.
                 let mut meta = format!("[from={}]", msg.sender);
+                if let Some(ref name) = from_name {
+                    meta.push_str(&format!("[name={}]", name));
+                }
                 if !attachment_paths.is_empty() {
                     meta.push_str(&format!("[attachment={}]", attachment_paths.join("|")));
                 }
@@ -523,8 +536,8 @@ async fn main() -> Result<()> {
                     meta.push_str(&format!("[link={}]", url));
                 }
                 let wrapped = format!("[CMD-{}]{}{}[/CMD-{}]", id, meta, msg.text, id);
-                info!("TMUX: Sending wrapped command with ID: {} (from={}, {} attachment(s), link={})",
-                    id, msg.sender, attachment_paths.len(), link.is_some());
+                info!("TMUX: Sending wrapped command with ID: {} (from={}, name={:?}, {} attachment(s), link={})",
+                    id, msg.sender, from_name, attachment_paths.len(), link.is_some());
 
                 match crate::tmux::execute_command(tc, &wrapped).await {
                     Ok(output) => {

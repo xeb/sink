@@ -6,6 +6,15 @@ host = "your-bluebubbles-host"  # Hostname or IP of BlueBubbles server
 port = 1234                      # BlueBubbles port
 password = "your-password"       # BlueBubbles password
 
+# Optional: read-only BlueBubbles instance for resolving sender handles to contact
+# names. Use this when the messaging account has no Contacts access but another
+# account/instance does. host/password default to [bluebubbles] when omitted.
+# [contacts]
+# enabled = true
+# port = 1234
+# host = "your-bluebubbles-host"
+# password = "your-password"
+
 [claude]
 working_dir = "/path/to/working/directory"  # Directory Claude runs in
 binary = "/path/to/claude"                   # Path to claude CLI binary

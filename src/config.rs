@@ -21,6 +21,8 @@ pub struct Config {
     pub tmux: Option<TmuxConfigSection>,
     #[serde(default)]
     pub gmail: Option<GmailConfig>,
+    #[serde(default)]
+    pub contacts: Option<ContactsConfig>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -28,6 +30,21 @@ pub struct BlueBubblesConfig {
     pub host: String,
     pub port: u16,
     pub password: String,
+}
+
+/// Read-only BlueBubbles instance used to resolve sender handles to contact names.
+/// In this deployment the message account (1235) has no address book, so name
+/// resolution points at the personal account (1234). host/password default to the
+/// main [bluebubbles] values when omitted.
+#[derive(Debug, Deserialize, Clone)]
+pub struct ContactsConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub host: Option<String>,
+    pub port: u16,
+    #[serde(default)]
+    pub password: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -212,6 +229,23 @@ impl Config {
     pub fn bluebubbles_url(&self) -> String {
         format!("http://{}:{}", self.bluebubbles.host, self.bluebubbles.port)
     }
+
+    /// Base URL for the read-only contacts instance, if contact resolution is enabled.
+    /// Falls back to the main bluebubbles host when [contacts].host is omitted.
+    pub fn contacts_url(&self) -> Option<String> {
+        self.contacts.as_ref().filter(|c| c.enabled).map(|c| {
+            let host = c.host.clone().unwrap_or_else(|| self.bluebubbles.host.clone());
+            format!("http://{}:{}", host, c.port)
+        })
+    }
+
+    /// Password for the contacts instance (falls back to the main bluebubbles password).
+    pub fn contacts_password(&self) -> String {
+        self.contacts
+            .as_ref()
+            .and_then(|c| c.password.clone())
+            .unwrap_or_else(|| self.bluebubbles.password.clone())
+    }
 }
 
 impl Default for Config {
@@ -242,6 +276,7 @@ impl Default for Config {
             web_server: None,
             tmux: None,
             gmail: None,
+            contacts: None,
         }
     }
 }
