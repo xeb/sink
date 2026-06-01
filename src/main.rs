@@ -62,6 +62,19 @@ fn extract_first_url(text: &str) -> Option<String> {
     re.find(text).map(|m| m.as_str().to_string())
 }
 
+/// Extract the [REPLY-id]...[/REPLY-id] content from captured tmux output.
+fn extract_reply(output: &str, id: &str) -> std::result::Result<String, String> {
+    let start_tag = format!("[REPLY-{}]", id);
+    let end_tag = format!("[/REPLY-{}]", id);
+    if let Some(start) = output.find(&start_tag) {
+        if let Some(end) = output[start..].find(&end_tag) {
+            return Ok(output[start + start_tag.len()..start + end].to_string());
+        }
+        return Err(format!("Response missing [/REPLY-{}] tag", id));
+    }
+    Err(format!("Response missing [REPLY-{}] tags", id))
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Initialize logging
@@ -150,6 +163,7 @@ async fn main() -> Result<()> {
         window: t.window.clone(),
         prompt: t.prompt.clone(),
         timeout_secs: t.timeout_secs,
+        extended_timeout_secs: t.extended_timeout_secs,
         capture_lines: t.capture_lines,
         capture_interval_ms: t.capture_interval_ms,
     });
@@ -512,6 +526,10 @@ async fn main() -> Result<()> {
         // contacts instance). Cached in-memory across messages.
         let from_name = contact_resolver.resolve(&msg.sender).await;
 
+        // Set when the user has already been told about a primary timeout, so the
+        // error path below doesn't send a second message if the extended wait also fails.
+        let mut timeout_notified = false;
+
         // Execute command via tmux or Claude depending on configuration
         let execution_result = if use_tmux {
             // TMUX MODE: Wrap message with unique ID and extract matching [REPLY-ID] from output
@@ -542,27 +560,36 @@ async fn main() -> Result<()> {
                 match crate::tmux::execute_command(tc, &wrapped).await {
                     Ok(output) => {
                         info!("TMUX: Raw output received, {} chars", output.len());
-                        // Extract content between [REPLY-ID] and [/REPLY-ID] tags for this specific command
-                        let reply_start_tag = format!("[REPLY-{}]", id);
-                        let reply_end_tag = format!("[/REPLY-{}]", id);
-
-                        if let Some(start) = output.find(&reply_start_tag) {
-                            if let Some(end) = output[start..].find(&reply_end_tag) {
-                                let reply_content = output[start + reply_start_tag.len()..start + end].to_string();
-                                info!("TMUX: Extracted reply for ID {}: {} chars", id, reply_content.len());
-                                Ok((reply_content, None))
-                            } else {
-                                error!("TMUX: Found [REPLY-{}] but no [/REPLY-{}] tag", id, id);
-                                Err(format!("Response missing [/REPLY-{}] tag", id))
-                            }
-                        } else {
-                            error!("TMUX: No [REPLY-{}] tag found in output", id);
-                            Err(format!("Response missing [REPLY-{}] tags", id))
-                        }
+                        extract_reply(&output, &id).map(|c| (c, None::<String>))
                     }
                     Err(e) => {
-                        error!("TMUX command failed: {}", e);
-                        Err(format!("TMUX execution error: {}", e))
+                        // Primary wait (timeout_secs) elapsed without a reply. Notify the
+                        // user now, but keep listening for extended_timeout_secs more so a
+                        // slow reply can still be delivered as a follow-up.
+                        warn!("TMUX primary wait timed out for {}: {}", id, e);
+                        let notice = format!(
+                            "⏳ Still working on this — no response yet after {} seconds. I'll keep going and send the answer here as soon as it's ready.",
+                            tc.timeout_secs
+                        );
+                        if let Err(se) = sender.send_with_retry(&msg.chat_guid, &notice, 2).await {
+                            error!("Failed to send timeout notice: {}", se);
+                        }
+                        info!(
+                            "TMUX: Continuing to listen for [REPLY-{}] for up to {}s more",
+                            id, tc.extended_timeout_secs
+                        );
+                        match crate::tmux::wait_for_reply(tc, &id, tc.extended_timeout_secs).await {
+                            Ok(output) => {
+                                info!("TMUX: Reply for {} arrived during extended wait", id);
+                                extract_reply(&output, &id).map(|c| (c, None::<String>))
+                            }
+                            Err(e2) => {
+                                error!("TMUX extended wait timed out for {}: {}", id, e2);
+                                // User was already notified at the primary timeout.
+                                timeout_notified = true;
+                                Err(format!("TMUX extended timeout: {}", e2))
+                            }
+                        }
                     }
                 }
             } else {
@@ -750,28 +777,39 @@ async fn main() -> Result<()> {
             Err(e) => {
                 error!("Command execution failed: {}", e);
 
-                // Send error response to user
-                let error_response = format!("⚠️ Error processing command: {}", e);
-                match sender
-                    .send_with_retry(&msg.chat_guid, &error_response, 3)
-                    .await
-                {
-                    Ok(response_guid) => {
-                        info!("Sent error response to user");
-                        for guid in &batch_guids {
-                            if let Err(err) = db.mark_processed(
-                                guid,
-                                response_guid.as_deref(),
-                                None,
-                            ) {
-                                error!("Failed to mark as processed: {}", err);
-                            }
+                if timeout_notified {
+                    // The user was already told at the primary timeout and the extended
+                    // wait still produced nothing — don't send a second message.
+                    info!("Suppressing duplicate error message (user already notified at primary timeout)");
+                    for guid in &batch_guids {
+                        if let Err(err) = db.mark_processed(guid, None, None) {
+                            error!("Failed to mark as processed: {}", err);
                         }
                     }
-                    Err(send_err) => {
-                        error!("Failed to send error response: {}", send_err);
-                        for guid in &batch_guids {
-                            let _ = db.mark_failed(guid);
+                } else {
+                    // Send error response to user
+                    let error_response = format!("⚠️ Error processing command: {}", e);
+                    match sender
+                        .send_with_retry(&msg.chat_guid, &error_response, 3)
+                        .await
+                    {
+                        Ok(response_guid) => {
+                            info!("Sent error response to user");
+                            for guid in &batch_guids {
+                                if let Err(err) = db.mark_processed(
+                                    guid,
+                                    response_guid.as_deref(),
+                                    None,
+                                ) {
+                                    error!("Failed to mark as processed: {}", err);
+                                }
+                            }
+                        }
+                        Err(send_err) => {
+                            error!("Failed to send error response: {}", send_err);
+                            for guid in &batch_guids {
+                                let _ = db.mark_failed(guid);
+                            }
                         }
                     }
                 }

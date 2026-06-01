@@ -191,6 +191,8 @@ pub struct TmuxConfigSection {
     pub prompt: String,
     #[serde(default = "default_tmux_timeout")]
     pub timeout_secs: u64,
+    #[serde(default = "default_tmux_extended_timeout")]
+    pub extended_timeout_secs: u64,
     #[serde(default = "default_tmux_capture_lines")]
     pub capture_lines: usize,
     #[serde(default = "default_tmux_poll_interval")]
@@ -207,6 +209,10 @@ fn default_tmux_prompt() -> String {
 
 fn default_tmux_timeout() -> u64 {
     90
+}
+
+fn default_tmux_extended_timeout() -> u64 {
+    600
 }
 
 fn default_tmux_capture_lines() -> usize {

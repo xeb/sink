@@ -6,11 +6,12 @@ use tracing::{debug, error, info};
 
 #[derive(Debug, Clone)]
 pub struct TmuxConfig {
-    pub window: String,            // Window name (e.g., "sink MASTER")
-    pub prompt: String,            // Prompt string (e.g., "❯")
-    pub timeout_secs: u64,         // Max wait time (default: 90)
-    pub capture_lines: usize,      // Max lines to capture (default: 200)
-    pub capture_interval_ms: u64,  // Poll interval (default: 200)
+    pub window: String,              // Window name (e.g., "sink MASTER")
+    pub prompt: String,              // Prompt string (e.g., "❯")
+    pub timeout_secs: u64,           // Primary wait before notifying the user (default: 90)
+    pub extended_timeout_secs: u64,  // Extra wait after the notice, for a slow reply (default: 600)
+    pub capture_lines: usize,        // Max lines to capture (default: 200)
+    pub capture_interval_ms: u64,    // Poll interval (default: 200)
 }
 
 impl Default for TmuxConfig {
@@ -19,6 +20,7 @@ impl Default for TmuxConfig {
             window: "sink MASTER".to_string(),
             prompt: "❯".to_string(),
             timeout_secs: 90,
+            extended_timeout_secs: 600,
             capture_lines: 200,
             capture_interval_ms: 200,
         }
@@ -102,6 +104,22 @@ pub async fn execute_command(config: &TmuxConfig, command_text: &str) -> Result<
 
     // Return the raw output - caller extracts [REPLY-ID]...[/REPLY-ID] content
     Ok(result)
+}
+
+/// Keep listening for [REPLY-ID] tags after the command was already sent and the
+/// primary wait timed out. Does NOT resend the command — it just continues polling
+/// the pane so a slow reply can still be delivered after the user has been notified.
+pub async fn wait_for_reply(
+    config: &TmuxConfig,
+    cmd_id: &str,
+    timeout_secs: u64,
+) -> Result<String, String> {
+    let target = find_target(&config.window)?;
+    info!(
+        "TMUX: Extended wait for [REPLY-{}] (up to {}s more)",
+        cmd_id, timeout_secs
+    );
+    wait_for_reply_tags(&target, cmd_id, timeout_secs, config.capture_interval_ms).await
 }
 
 /// Send literal text to tmux window (via -l flag, prevents escape sequence interpretation)
