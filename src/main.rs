@@ -36,25 +36,6 @@ use std::sync::Arc;
 use tokio::time::{interval, Duration};
 use tracing::{debug, error, info, warn};
 
-/// True if an attachment is viewable media (image/video) worth downloading and
-/// handing to Claude. Skips link-preview payloads (.pluginPayloadAttachment),
-/// vcards, and other non-media attachment types.
-fn is_media_attachment(a: &poller::Attachment) -> bool {
-    if let Some(mime) = a.mime_type.as_deref() {
-        return mime.starts_with("image/") || mime.starts_with("video/");
-    }
-    // Fall back to the transfer filename extension when mime type is absent.
-    if let Some(name) = a.transfer_name.as_deref() {
-        let lower = name.to_ascii_lowercase();
-        return [
-            ".jpg", ".jpeg", ".png", ".gif", ".heic", ".heif", ".webp", ".mov", ".mp4",
-        ]
-        .iter()
-        .any(|ext| lower.ends_with(ext));
-    }
-    false
-}
-
 /// Extract the first http(s) URL from message text, if any. Used to surface a
 /// `link=` field for blank/link-only messages so the session can fetch it.
 fn extract_first_url(text: &str) -> Option<String> {
@@ -62,17 +43,65 @@ fn extract_first_url(text: &str) -> Option<String> {
     re.find(text).map(|m| m.as_str().to_string())
 }
 
+/// True if a captured pane line marks the end of an assistant turn / start of
+/// TUI chrome — used to bound a reply when Claude dropped the closing tag.
+/// `✻ …` is the post-turn summary ("Crunched for 50s"), `❯` is the input box or
+/// an echoed user line, `─` is a separator rule, and `● [REPLY-`/`[CMD-` begin a
+/// new turn. "esc to interrupt" only appears while a turn is still streaming.
+fn is_tui_boundary(line_trimmed: &str) -> bool {
+    line_trimmed.starts_with('✻')
+        || line_trimmed.starts_with('❯')
+        || line_trimmed.starts_with('─')
+        || line_trimmed.starts_with("● [REPLY-")
+        || line_trimmed.starts_with("[CMD-")
+        || line_trimmed.contains("esc to interrupt")
+}
+
 /// Extract the [REPLY-id]...[/REPLY-id] content from captured tmux output.
+///
+/// Claude occasionally emits the `[REPLY-id]` opener but drops the matching
+/// `[/REPLY-id]` closer (usually on long answers). Rather than fail — leaving a
+/// complete, on-screen answer undelivered — we fall back to taking everything
+/// from the opener up to the first TUI boundary line (the `✻ …` turn summary,
+/// the input prompt, etc.). `rfind` on the opener also handles the case where an
+/// earlier dropped attempt and a resend both left an opener in the buffer.
 fn extract_reply(output: &str, id: &str) -> std::result::Result<String, String> {
     let start_tag = format!("[REPLY-{}]", id);
     let end_tag = format!("[/REPLY-{}]", id);
-    if let Some(start) = output.find(&start_tag) {
-        if let Some(end) = output[start..].find(&end_tag) {
-            return Ok(output[start + start_tag.len()..start + end].to_string());
-        }
-        return Err(format!("Response missing [/REPLY-{}] tag", id));
+
+    let start = match output.rfind(&start_tag) {
+        Some(s) => s,
+        None => return Err(format!("Response missing [REPLY-{}] tags", id)),
+    };
+    let body_start = start + start_tag.len();
+
+    // Clean path: matching closing tag present after the opener.
+    if let Some(end) = output[body_start..].find(&end_tag) {
+        return Ok(output[body_start..body_start + end].trim().to_string());
     }
-    Err(format!("Response missing [REPLY-{}] tags", id))
+
+    // Recovery path: closer missing — take the body up to the first TUI boundary.
+    let mut body_lines: Vec<&str> = Vec::new();
+    for (i, line) in output[body_start..].lines().enumerate() {
+        // i == 0 is the remainder of the opener line (response text), never a boundary.
+        if i > 0 && is_tui_boundary(line.trim_start()) {
+            break;
+        }
+        body_lines.push(line);
+    }
+    let body = body_lines.join("\n").trim().to_string();
+    if body.is_empty() {
+        return Err(format!(
+            "Response missing [/REPLY-{}] tag and no recoverable body before TUI boundary",
+            id
+        ));
+    }
+    warn!(
+        "extract_reply: [/REPLY-{}] tag missing; recovered {} chars up to TUI boundary",
+        id,
+        body.len()
+    );
+    Ok(body)
 }
 
 #[tokio::main]
@@ -240,8 +269,6 @@ async fn main() -> Result<()> {
         let web_config = config.web_server.clone().unwrap_or_default();
         let state = web::AppState {
             db_path: config.database.path.clone(),
-            transcripts_db_path: transcripts_db_path.clone(),
-            followups_db_path: followups_db_path.clone(),
         };
         let host = web_config.host.clone();
         let port = web_config.port;
@@ -394,7 +421,7 @@ async fn main() -> Result<()> {
             let handler = CommandHandler::new(&followups_db, default_snooze);
             match handler.handle(command, &msg.chat_guid, &msg.sender) {
                 Ok(response) => {
-                    if let Err(e) = sender.send_with_retry(&msg.chat_guid, &response, 3).await {
+                    if let Err(e) = sender.send_with_retry(&msg.chat_guid, &response, 10).await {
                         error!("Failed to send command response: {}", e);
                     }
                     for guid in &batch_guids {
@@ -405,8 +432,9 @@ async fn main() -> Result<()> {
                 }
                 Err(e) => {
                     error!("Command handler error: {}", e);
+                    let reason = format!("Command handler error: {}", e);
                     for guid in &batch_guids {
-                        let _ = db.mark_failed(guid);
+                        let _ = db.mark_failed(guid, &reason);
                     }
                 }
             }
@@ -486,8 +514,9 @@ async fn main() -> Result<()> {
             Ok(v) => v,
             Err(e) => {
                 error!("Failed to get chat history: {}", e);
+                let reason = format!("Failed to get chat history: {}", e);
                 for guid in &batch_guids {
-                    let _ = db.mark_failed(guid);
+                    let _ = db.mark_failed(guid, &reason);
                 }
                 continue;
             }
@@ -499,24 +528,16 @@ async fn main() -> Result<()> {
             .filter(|m| !batch_guids.contains(&m.guid))
             .collect();
 
-        // Download media attachments (images/videos) — BOTH tmux and Claude modes need
-        // these. Non-media payloads (e.g. link-preview .pluginPayloadAttachment) are skipped
-        // so the session is never handed a non-image to Read.
+        // Download every attachment and hand the paths to Claude — the Read tool
+        // (and the model itself) can figure out what each file is. BOTH tmux and
+        // Claude modes need these.
         let attachment_paths = if msg.attachments.is_empty() {
             Vec::new()
         } else {
-            let media: Vec<_> = msg
-                .attachments
-                .iter()
-                .filter(|a| is_media_attachment(a))
-                .cloned()
-                .collect();
-            if media.is_empty() {
-                Vec::new()
-            } else {
-                info!("Downloading {} media attachment(s)", media.len());
-                attachment_downloader.download_all(&media, &msg.guid).await
-            }
+            info!("Downloading {} attachment(s)", msg.attachments.len());
+            attachment_downloader
+                .download_all(&msg.attachments, &msg.guid)
+                .await
         };
 
         // Surface the first URL in the message text (covers blank/link-only messages).
@@ -662,7 +683,7 @@ async fn main() -> Result<()> {
                 // Send response
                 info!("Sending response via iMessage: {} chars", response_text.len());
                 match sender
-                    .send_with_retry(&msg.chat_guid, &response_text, 3)
+                    .send_with_retry(&msg.chat_guid, &response_text, 10)
                     .await
                 {
                     Ok(response_guid) => {
@@ -768,8 +789,9 @@ async fn main() -> Result<()> {
                     }
                     Err(e) => {
                         error!("Failed to send response: {}", e);
+                        let reason = format!("Failed to send response: {}", e);
                         for guid in &batch_guids {
-                            let _ = db.mark_failed(guid);
+                            let _ = db.mark_failed(guid, &reason);
                         }
                     }
                 }
@@ -790,7 +812,7 @@ async fn main() -> Result<()> {
                     // Send error response to user
                     let error_response = format!("⚠️ Error processing command: {}", e);
                     match sender
-                        .send_with_retry(&msg.chat_guid, &error_response, 3)
+                        .send_with_retry(&msg.chat_guid, &error_response, 10)
                         .await
                     {
                         Ok(response_guid) => {
@@ -807,8 +829,12 @@ async fn main() -> Result<()> {
                         }
                         Err(send_err) => {
                             error!("Failed to send error response: {}", send_err);
+                            let reason = format!(
+                                "Claude failed ({}), then sending the error notice also failed: {}",
+                                e, send_err
+                            );
                             for guid in &batch_guids {
-                                let _ = db.mark_failed(guid);
+                                let _ = db.mark_failed(guid, &reason);
                             }
                         }
                     }
@@ -852,4 +878,51 @@ fn build_conversation_for_extraction(
     conversation.push_str(&format!("Claude: {}\n", claude_response));
 
     conversation
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{extract_reply, is_tui_boundary};
+
+    #[test]
+    fn clean_path_extracts_between_tags() {
+        let out = "noise\n● [REPLY-abcd]hello world\n[/REPLY-abcd]\n✻ Brewed for 5s";
+        assert_eq!(extract_reply(out, "abcd").unwrap(), "hello world");
+    }
+
+    #[test]
+    fn recovers_when_closer_dropped_bounded_by_summary() {
+        // Opener present, no [/REPLY-abcd]; body ends at the "✻ …" turn summary.
+        let out = "● [REPLY-abcd]line one\n  line two\n\n✻ Crunched for 27s\n\n❯ next prompt";
+        assert_eq!(extract_reply(out, "abcd").unwrap(), "line one\n  line two");
+    }
+
+    #[test]
+    fn recovers_when_closer_dropped_bounded_by_next_cmd() {
+        let out = "● [REPLY-abcd]answer body\n[CMD-ef01][from=x]new question[/CMD-ef01]";
+        assert_eq!(extract_reply(out, "abcd").unwrap(), "answer body");
+    }
+
+    #[test]
+    fn rfind_prefers_latest_complete_opener_after_resend() {
+        // First attempt dropped the closer; a resend produced a complete pair.
+        let out = "● [REPLY-abcd]first try\n✻ Crunched\n❯ resend please\n● [REPLY-abcd]second try\n[/REPLY-abcd]";
+        assert_eq!(extract_reply(out, "abcd").unwrap(), "second try");
+    }
+
+    #[test]
+    fn missing_opener_is_an_error() {
+        assert!(extract_reply("just some text", "abcd").is_err());
+    }
+
+    #[test]
+    fn tui_boundary_detection() {
+        assert!(is_tui_boundary("✻ Crunched for 5s"));
+        assert!(is_tui_boundary("❯ next"));
+        assert!(is_tui_boundary("[CMD-ab12]hi[/CMD-ab12]"));
+        assert!(is_tui_boundary("● [REPLY-ab12]hi"));
+        assert!(is_tui_boundary("spinner (esc to interrupt)"));
+        assert!(!is_tui_boundary("• a normal bullet list item"));
+        assert!(!is_tui_boundary("regular response text"));
+    }
 }

@@ -19,6 +19,7 @@ pub struct Message {
     pub status: String,
     pub is_from_me: bool,
     pub gemini_reason: Option<String>,
+    pub error_reason: Option<String>,
     #[serde(skip)]
     pub attachments: Vec<Attachment>,
 }
@@ -91,6 +92,16 @@ impl Database {
             self.conn.execute("ALTER TABLE messages ADD COLUMN attachments_json TEXT", [])?;
         }
 
+        // Migration: add error_reason column if it doesn't exist
+        let has_error_reason: bool = self.conn.query_row(
+            "SELECT COUNT(*) > 0 FROM pragma_table_info('messages') WHERE name = 'error_reason'",
+            [],
+            |row| row.get(0),
+        )?;
+        if !has_error_reason {
+            self.conn.execute("ALTER TABLE messages ADD COLUMN error_reason TEXT", [])?;
+        }
+
         Ok(())
     }
 
@@ -133,7 +144,7 @@ impl Database {
         let mut stmt = self.conn.prepare(
             r#"
             SELECT id, guid, chat_guid, sender, text, date_received,
-                   processed_at, response_guid, session_id, status, is_from_me, gemini_reason, attachments_json
+                   processed_at, response_guid, session_id, status, is_from_me, gemini_reason, attachments_json, error_reason
             FROM messages
             WHERE status = 'pending' AND is_from_me = 0
             ORDER BY date_received ASC
@@ -159,6 +170,7 @@ impl Database {
                         .get::<_, Option<String>>(12)?
                         .and_then(|s| serde_json::from_str(&s).ok())
                         .unwrap_or_default(),
+                    error_reason: row.get(13)?,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -170,7 +182,7 @@ impl Database {
         let mut stmt = self.conn.prepare(
             r#"
             SELECT id, guid, chat_guid, sender, text, date_received,
-                   processed_at, response_guid, session_id, status, is_from_me, gemini_reason, attachments_json
+                   processed_at, response_guid, session_id, status, is_from_me, gemini_reason, attachments_json, error_reason
             FROM messages
             WHERE chat_guid = ?
             ORDER BY date_received DESC
@@ -197,6 +209,7 @@ impl Database {
                         .get::<_, Option<String>>(12)?
                         .and_then(|s| serde_json::from_str(&s).ok())
                         .unwrap_or_default(),
+                    error_reason: row.get(13)?,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -228,11 +241,11 @@ impl Database {
         Ok(())
     }
 
-    pub fn mark_failed(&self, guid: &str) -> Result<()> {
+    pub fn mark_failed(&self, guid: &str, reason: &str) -> Result<()> {
         let now = chrono::Utc::now().timestamp_millis();
         self.conn.execute(
-            "UPDATE messages SET status = 'failed', processed_at = ? WHERE guid = ?",
-            params![now, guid],
+            "UPDATE messages SET status = 'failed', processed_at = ?, error_reason = ? WHERE guid = ?",
+            params![now, reason, guid],
         )?;
         Ok(())
     }
@@ -275,7 +288,7 @@ impl Database {
         let mut stmt = self.conn.prepare(
             r#"
             SELECT id, guid, chat_guid, sender, text, date_received,
-                   processed_at, response_guid, session_id, status, is_from_me, gemini_reason, attachments_json
+                   processed_at, response_guid, session_id, status, is_from_me, gemini_reason, attachments_json, error_reason
             FROM messages
             WHERE status = 'pending' AND is_from_me = 0 AND chat_guid = ?
             ORDER BY date_received ASC
@@ -301,6 +314,7 @@ impl Database {
                         .get::<_, Option<String>>(12)?
                         .and_then(|s| serde_json::from_str(&s).ok())
                         .unwrap_or_default(),
+                    error_reason: row.get(13)?,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;

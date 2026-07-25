@@ -2,7 +2,13 @@ use regex::Regex;
 use std::process::Command;
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
+
+/// Consecutive idle polls (no live spinner) required before accepting a reply
+/// whose `[REPLY-id]` opener is present but whose `[/REPLY-id]` closer Claude
+/// dropped. At the default 200ms poll interval this is ~0.6s of confirmation,
+/// enough to rule out a closer that is merely one frame behind the spinner.
+const IDLE_CONFIRM_POLLS: u32 = 3;
 
 #[derive(Debug, Clone)]
 pub struct TmuxConfig {
@@ -152,10 +158,22 @@ fn send_keys_key(target: &str, key: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Capture pane content from tmux window
+/// Heuristic for "Claude has finished rendering this turn". Claude Code shows
+/// "(esc to interrupt)" next to its live spinner while a turn is running; its
+/// absence means the turn is done. Glyph-independent, so it survives spinner
+/// wording changes (Crunched/Churned/Brewed/…).
+fn pane_is_idle(content: &str) -> bool {
+    !content.contains("esc to interrupt")
+}
+
+/// Capture pane content from tmux window.
+///
+/// `-J` joins wrapped lines (so a `[/REPLY-id]` closer appended to a long line
+/// can't be split across rows and miss a `contains` check) and `-S -1000` widens
+/// the scrollback window so both tags of a long reply fit in one capture.
 fn capture_pane(target: &str) -> Result<String, String> {
     let output = Command::new("tmux")
-        .args(&["capture-pane", "-t", target, "-p", "-S", "-100"])
+        .args(&["capture-pane", "-t", target, "-p", "-J", "-S", "-1000"])
         .output()
         .map_err(|e| format!("Failed to execute tmux capture-pane: {}", e))?;
 
@@ -177,14 +195,38 @@ async fn wait_for_reply_tags(target: &str, cmd_id: &str, timeout_secs: u64, poll
     let reply_end_tag = format!("[/REPLY-{}]", cmd_id);
 
     let mut poll_count = 0;
+    let mut idle_with_opener = 0u32;
     loop {
         poll_count += 1;
         let content = capture_pane(target)?;
 
-        // Look for [REPLY-ID] tags (specific to this command)
-        if content.contains(&reply_start_tag) && content.contains(&reply_end_tag) {
+        let has_open = content.contains(&reply_start_tag);
+        let has_close = content.contains(&reply_end_tag);
+
+        // Clean path: both tags present.
+        if has_open && has_close {
             info!("TMUX: Found [REPLY-{}] tags after {} polls", cmd_id, poll_count);
             return Ok(content);
+        }
+
+        // Recovery path: opener present, closer missing. If Claude has gone idle
+        // (no live "esc to interrupt" spinner) for several consecutive polls, the
+        // model almost certainly dropped the closing tag — accept the response
+        // now rather than waiting out the full timeout on a complete, on-screen
+        // answer. extract_reply() recovers the body up to the first TUI boundary.
+        if has_open {
+            if pane_is_idle(&content) {
+                idle_with_opener += 1;
+                if idle_with_opener >= IDLE_CONFIRM_POLLS {
+                    warn!(
+                        "TMUX: [REPLY-{}] opener present but closer missing and Claude idle for {} polls — accepting reply without closing tag",
+                        cmd_id, idle_with_opener
+                    );
+                    return Ok(content);
+                }
+            } else {
+                idle_with_opener = 0; // still streaming; reset confirmation
+            }
         }
 
         // Check timeout

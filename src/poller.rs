@@ -137,6 +137,7 @@ impl Poller {
                     status: if m.is_from_me { "sent".to_string() } else { "pending".to_string() },
                     is_from_me: m.is_from_me,
                     gemini_reason: None,
+                    error_reason: None,
                     attachments: m.attachments,
                 })
             })

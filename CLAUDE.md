@@ -7,7 +7,9 @@ A Rust daemon that bridges iMessage (via BlueBubbles) with Claude Code. When som
 ```bash
 # Build and update (no sudo required)
 cargo build --release
-cp target/release/sink ~/.local/bin/sink
+# Plain `cp` over the running binary fails with "Text file busy" — write beside
+# it and rename, which swaps the directory entry without touching the live inode.
+cp target/release/sink ~/.local/bin/sink.new && mv -f ~/.local/bin/sink.new ~/.local/bin/sink
 systemctl --user restart sink
 
 # Service control (no sudo required)
@@ -214,14 +216,34 @@ src/
 
 ## Web Admin Panel
 
-The daemon includes a web-based admin panel on port 1111 with:
+A single page on port 1111: a flat, reverse-chronological list of every inbound message, its
+outcome, and the reply that went back. Rewritten 2026-07-24 — the old Dashboard / Messages /
+Transcripts / Followups tabs are gone, along with their endpoints.
 
-- **Dashboard**: Stats overview (pending/replied/failed counts, costs)
-- **Messages**: View and filter all processed messages
-- **Transcripts**: Full Claude session transcripts with cost/token data
-- **Followups**: Manage scheduled notifications (currently disabled)
+- **The list** — one row per inbound message: time, sender handle, text, outcome. A coloured edge
+  runs down the left of the log so the health of the whole thing reads in one vertical scan.
+- **Click a row** — it expands in place to show Claude's reply and the round-trip time. Failed
+  messages show `error_reason`; ignored ones show `gemini_reason`; anything that failed before
+  reason-tracking existed says so and points at `journalctl`.
+- **Filter** — `all / replied / failed / waiting / ignored` pills (counts are whole-log totals,
+  not page totals), plus substring search over message text.
 
-Access at `http://localhost:1111` or configure reverse proxy with auth.
+Only two routes exist: `GET /` and `GET /api/messages?limit&offset&status&q`. The reply text is
+resolved by a `LEFT JOIN` from `response_guid` back to the outbound row in the *same* table, so the
+panel never touches `transcripts.db` — sessions and cost data are deliberately not shown.
+
+Access locally at `http://localhost:1111`, or remotely at **https://sink.xeb.ai** (Cloudflare
+tunnel → Access gate, `xebxeb@gmail.com` only; set up 2026-07-24).
+
+The panel has **no authentication of its own** and serves the full message history and every reply
+over `/api/messages`. What that means in practice:
+
+- **From the internet** — protected by the Cloudflare Access gate on `sink.xeb.ai` (domain-level,
+  so `/api/*` is covered too; `xebxeb@gmail.com` only). That gate is the only auth; never add a
+  tunnel hostname for port 1111 without one. App IDs in `~/p/master/docs/cloudflare.md`.
+- **From the LAN** — deliberately wide open. It binds `0.0.0.0:1111` (`[web_server]` in
+  `/etc/sink/config.toml`), so anyone on the local network reads the full panel with no login.
+  This is intentional per Mark (2026-07-24); don't "harden" it to `127.0.0.1`.
 
 ## Debugging
 

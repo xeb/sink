@@ -184,13 +184,18 @@ New message:  [CMD-a1b2]New question[/CMD-a1b2]
 
 ## Admin Panel
 
-Access the web admin panel at `http://localhost:1111`:
+Access the web admin panel at `http://localhost:1111`.
 
-- **Dashboard**: Message stats, response times
-- **Messages**: View/filter all messages
-- **Transcripts**: Full session history (if using subprocess mode)
+It is a single page: a flat, newest-first list of every inbound message with its outcome
+(`replied` / `failed` / `waiting` / `ignored`). Click any row to expand it in place and read
+Claude's reply along with the round-trip time; failed messages show the recorded reason instead.
+Filter by outcome or search the message text.
 
-For production, configure a reverse proxy with authentication.
+The panel exposes one endpoint, `GET /api/messages?limit&offset&status&q`, and reads only
+`messages.db`.
+
+The panel has no authentication of its own — put it behind a reverse proxy or an
+identity-aware proxy before exposing it beyond your machine.
 
 ## Configuration Reference
 

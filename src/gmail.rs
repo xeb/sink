@@ -175,11 +175,11 @@ pub async fn send_auth_request(sender: &Sender, cfg: &GmailConfig, auth_url: &st
         "Gmail authentication has expired for {}. Please re-authenticate by clicking the link below, then text back the localhost URL it redirects to.",
         cfg.account
     );
-    if let Err(e) = sender.send_with_retry(&cfg.owner_chat_guid, &msg, 3).await {
+    if let Err(e) = sender.send_with_retry(&cfg.owner_chat_guid, &msg, 10).await {
         error!("Failed to send gmail auth request: {}", e);
     }
 
-    if let Err(e) = sender.send_with_retry(&cfg.owner_chat_guid, auth_url, 3).await {
+    if let Err(e) = sender.send_with_retry(&cfg.owner_chat_guid, auth_url, 10).await {
         error!("Failed to send gmail auth URL: {}", e);
     }
 }
