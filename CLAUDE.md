@@ -280,3 +280,4 @@ curl -s "http://YOUR_BLUEBUBBLES_HOST:PORT/api/v1/server/info?password=YOUR_PASS
 | Claude responds to group chat side conversations | Check Gemini API key is set; verify with logs |
 | Double messages from followups | Fixed; scheduler tells Claude not to send messages directly |
 | Message stuck in "processing" | Check `journalctl --user -u sink -f` for errors; reset with `sqlite3 /var/lib/sink/messages.db "UPDATE messages SET status='pending' WHERE status='processing'"` |
+| Commands sent to tmux but no reply ever arrives | The target pane was left in a tmux mode (copy-mode / tree-mode), which swallows `send-keys`. Sink now clears it automatically before each send; check with `tmux display-message -p -t "0:sink MASTER" '#{pane_mode}'` and clear manually with `tmux copy-mode -q -t "0:sink MASTER"` (`send-keys -X cancel` fails when a detached client orphaned the mode). |

@@ -62,6 +62,13 @@ pub async fn execute_command(config: &TmuxConfig, command_text: &str) -> Result<
     let target = find_target(&config.window)?;
     info!("TMUX: Starting command execution in {}", target);
 
+    // Step -2: Leave any tmux pane mode (copy-mode / tree-mode / …) first.
+    // While a pane is in a mode, tmux routes send-keys to the mode's key table
+    // instead of the program underneath, so every keystroke we send is silently
+    // swallowed and the reply never arrives. A detached client can strand a pane
+    // in tree-mode indefinitely (seen 2026-08-09), which wedged the daemon.
+    exit_pane_mode(&target);
+
     // Step -1: Send 3 Enters with 100ms pause to prepare prompt
     info!("TMUX: Sending 3 Enter keys to prepare prompt");
     for _ in 0..3 {
@@ -126,6 +133,38 @@ pub async fn wait_for_reply(
         cmd_id, timeout_secs
     );
     wait_for_reply_tags(&target, cmd_id, timeout_secs, config.capture_interval_ms).await
+}
+
+/// Drop the target pane out of any tmux mode so send-keys reaches the program.
+///
+/// `copy-mode -q` cancels whichever mode is active (it is a no-op on a pane that
+/// isn't in one), and unlike `send-keys -X cancel` it still works when the mode
+/// was orphaned by a detached client. Best-effort: a failure here shouldn't stop
+/// us from trying to send the command.
+fn exit_pane_mode(target: &str) {
+    let in_mode = Command::new("tmux")
+        .args(&["display-message", "-p", "-t", target, "#{pane_in_mode}"])
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "1")
+        .unwrap_or(false);
+
+    if !in_mode {
+        return;
+    }
+
+    warn!("TMUX: Pane is in a tmux mode (keys would be swallowed) — cancelling it");
+    match Command::new("tmux")
+        .args(&["copy-mode", "-q", "-t", target])
+        .output()
+    {
+        Ok(o) if o.status.success() => info!("TMUX: Pane mode cancelled"),
+        Ok(o) => warn!(
+            "TMUX: Failed to cancel pane mode: {}",
+            String::from_utf8_lossy(&o.stderr).trim()
+        ),
+        Err(e) => warn!("TMUX: Failed to run tmux copy-mode -q: {}", e),
+    }
 }
 
 /// Send literal text to tmux window (via -l flag, prevents escape sequence interpretation)
