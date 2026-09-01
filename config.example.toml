@@ -29,6 +29,18 @@ path = "/var/lib/sink/messages.db"
 [context]
 message_history_count = 20  # Number of previous messages to include as context
 
+# Optional: inject messages into a persistent interactive agent in tmux.
+# When restart_command is set, sink respawns this pane at daemon startup.
+# It runs through interactive Bash so ~/.bash_aliases functions are available.
+# [tmux]
+# window = "sink MASTER"
+# restart_command = "codex --yolo"
+# prompt = "›"
+# timeout_secs = 300
+# extended_timeout_secs = 600
+# capture_lines = 200
+# capture_interval_ms = 200
+
 # Optional: For group chat filtering
 # If not set, all group chat messages will be processed
 [gemini]

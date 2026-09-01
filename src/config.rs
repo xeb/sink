@@ -187,6 +187,11 @@ impl Default for WebServerConfig {
 pub struct TmuxConfigSection {
     #[serde(default = "default_tmux_window")]
     pub window: String,
+    /// When set, sink respawns the target pane with this command at daemon startup.
+    /// The command runs in an interactive Bash shell so functions and aliases from
+    /// ~/.bash_aliases are available.
+    #[serde(default)]
+    pub restart_command: Option<String>,
     #[serde(default = "default_tmux_prompt")]
     pub prompt: String,
     #[serde(default = "default_tmux_timeout")]

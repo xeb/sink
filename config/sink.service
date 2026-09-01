@@ -1,5 +1,5 @@
 [Unit]
-Description=Sink - iMessage to Claude daemon
+Description=Sink - iMessage to Codex daemon
 After=network.target
 
 [Service]
@@ -10,7 +10,7 @@ RestartSec=10
 # Update these for your system:
 # User=youruser
 # Group=yourgroup
-# WorkingDirectory=/path/to/claude/working/dir
+# WorkingDirectory=/path/to/agent/working/dir
 Environment=SINK_CONFIG=/etc/sink/config.toml
 Environment=RUST_LOG=sink=info
 # Environment=PATH=/path/to/node/bin:/usr/local/bin:/usr/bin:/bin
@@ -21,7 +21,7 @@ StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=sink
 
-# No filesystem restrictions - Claude needs full disk access
+# No filesystem restrictions - Codex needs full disk access
 PrivateTmp=yes
 
 [Install]

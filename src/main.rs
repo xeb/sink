@@ -21,7 +21,7 @@ use crate::commands::{CommandHandler, CommandParser};
 use crate::config::Config;
 use crate::contacts::ContactResolver;
 use crate::db::{Database, Message};
-use crate::error::Result;
+use crate::error::{Result, SinkError};
 use crate::followups::{Followup, FollowupsDb};
 use crate::gemini::GeminiExtractor;
 use crate::poller::Poller;
@@ -44,13 +44,14 @@ fn extract_first_url(text: &str) -> Option<String> {
 }
 
 /// True if a captured pane line marks the end of an assistant turn / start of
-/// TUI chrome — used to bound a reply when Claude dropped the closing tag.
-/// `✻ …` is the post-turn summary ("Crunched for 50s"), `❯` is the input box or
+/// TUI chrome — used to bound a reply when the agent dropped the closing tag.
+/// `✻ …` is the post-turn summary ("Crunched for 50s"), `❯`/`›` is the input box or
 /// an echoed user line, `─` is a separator rule, and `● [REPLY-`/`[CMD-` begin a
 /// new turn. "esc to interrupt" only appears while a turn is still streaming.
 fn is_tui_boundary(line_trimmed: &str) -> bool {
     line_trimmed.starts_with('✻')
         || line_trimmed.starts_with('❯')
+        || line_trimmed.starts_with('›')
         || line_trimmed.starts_with('─')
         || line_trimmed.starts_with("● [REPLY-")
         || line_trimmed.starts_with("[CMD-")
@@ -190,6 +191,7 @@ async fn main() -> Result<()> {
     let use_tmux = config.tmux.is_some();
     let tmux_config = config.tmux.as_ref().map(|t| TmuxConfig {
         window: t.window.clone(),
+        restart_command: t.restart_command.clone(),
         prompt: t.prompt.clone(),
         timeout_secs: t.timeout_secs,
         extended_timeout_secs: t.extended_timeout_secs,
@@ -201,6 +203,14 @@ async fn main() -> Result<()> {
         info!("TMUX mode enabled, window: {}",
             tmux_config.as_ref().map(|c| c.window.as_str()).unwrap_or("?")
         );
+        if let Some(tc) = tmux_config
+            .as_ref()
+            .filter(|tc| tc.restart_command.is_some())
+        {
+            crate::tmux::restart_agent(tc, &config.claude.working_dir).map_err(|e| {
+                SinkError::Config(format!("Failed to restart tmux agent: {}", e))
+            })?;
+        }
     } else {
         info!("Claude mode enabled (no [tmux] config section found)");
     }
@@ -919,6 +929,7 @@ mod tests {
     fn tui_boundary_detection() {
         assert!(is_tui_boundary("✻ Crunched for 5s"));
         assert!(is_tui_boundary("❯ next"));
+        assert!(is_tui_boundary("› next"));
         assert!(is_tui_boundary("[CMD-ab12]hi[/CMD-ab12]"));
         assert!(is_tui_boundary("● [REPLY-ab12]hi"));
         assert!(is_tui_boundary("spinner (esc to interrupt)"));

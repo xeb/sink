@@ -2,7 +2,7 @@
 name = "sink"
 version = "0.1.0"
 edition = "2021"
-description = "iMessage to Claude daemon"
+description = "iMessage to Codex daemon"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }

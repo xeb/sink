@@ -1,4 +1,5 @@
 use regex::Regex;
+use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
@@ -12,18 +13,20 @@ const IDLE_CONFIRM_POLLS: u32 = 3;
 
 #[derive(Debug, Clone)]
 pub struct TmuxConfig {
-    pub window: String,              // Window name (e.g., "sink MASTER")
-    pub prompt: String,              // Prompt string (e.g., "❯")
-    pub timeout_secs: u64,           // Primary wait before notifying the user (default: 90)
-    pub extended_timeout_secs: u64,  // Extra wait after the notice, for a slow reply (default: 600)
-    pub capture_lines: usize,        // Max lines to capture (default: 200)
-    pub capture_interval_ms: u64,    // Poll interval (default: 200)
+    pub window: String,                  // Window name (e.g., "sink MASTER")
+    pub restart_command: Option<String>, // Command used to respawn the pane at daemon startup
+    pub prompt: String,                  // Prompt string (e.g., "❯")
+    pub timeout_secs: u64,               // Primary wait before notifying the user (default: 90)
+    pub extended_timeout_secs: u64, // Extra wait after the notice, for a slow reply (default: 600)
+    pub capture_lines: usize,       // Max lines to capture (default: 200)
+    pub capture_interval_ms: u64,   // Poll interval (default: 200)
 }
 
 impl Default for TmuxConfig {
     fn default() -> Self {
         TmuxConfig {
             window: "sink MASTER".to_string(),
+            restart_command: None,
             prompt: "❯".to_string(),
             timeout_secs: 90,
             extended_timeout_secs: 600,
@@ -31,6 +34,82 @@ impl Default for TmuxConfig {
             capture_interval_ms: 200,
         }
     }
+}
+
+/// Quote one argument for a POSIX shell. tmux executes its `shell-command`
+/// through a shell, so the command passed to Bash must survive that outer
+/// parsing layer unchanged.
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+fn interactive_bash_command(command: &str) -> String {
+    format!("exec bash -ic {}", shell_quote(command))
+}
+
+/// Restart the target pane with the configured interactive agent command.
+///
+/// Bash is deliberately interactive here: the local `codex --yolo` wrapper is
+/// defined in ~/.bash_aliases, which ~/.bashrc sources only for interactive
+/// shells. `remain-on-exit` keeps the named pane available for a later daemon
+/// restart even if the agent exits immediately.
+pub fn restart_agent(config: &TmuxConfig, working_dir: &Path) -> Result<(), String> {
+    let command = config
+        .restart_command
+        .as_deref()
+        .ok_or_else(|| "No tmux restart command configured".to_string())?;
+    if command.trim().is_empty() {
+        return Err("Tmux restart command cannot be empty".to_string());
+    }
+
+    let target = find_target(&config.window)?;
+    info!(
+        "TMUX: Respawning {} in {:?} with interactive command: {}",
+        target, working_dir, command
+    );
+
+    let remain = Command::new("tmux")
+        .args(["set-option", "-p", "-t", &target, "remain-on-exit", "on"])
+        .output()
+        .map_err(|e| format!("Failed to configure tmux pane {}: {}", target, e))?;
+    if !remain.status.success() {
+        return Err(format!(
+            "tmux set-option failed for {}: {}",
+            target,
+            String::from_utf8_lossy(&remain.stderr).trim()
+        ));
+    }
+
+    let shell_command = interactive_bash_command(command);
+    let working_dir = working_dir.to_str().ok_or_else(|| {
+        format!(
+            "Tmux working directory is not valid UTF-8: {:?}",
+            working_dir
+        )
+    })?;
+    let output = Command::new("tmux")
+        .args([
+            "respawn-pane",
+            "-k",
+            "-t",
+            &target,
+            "-c",
+            working_dir,
+            &shell_command,
+        ])
+        .output()
+        .map_err(|e| format!("Failed to respawn tmux pane {}: {}", target, e))?;
+
+    if !output.status.success() {
+        return Err(format!(
+            "tmux respawn-pane failed for {}: {}",
+            target,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    info!("TMUX: Respawned {} successfully", target);
+    Ok(())
 }
 
 /// Find the tmux target (session:window) by searching all sessions for the named window
@@ -57,7 +136,7 @@ fn find_target(window_name: &str) -> Result<String, String> {
     Err(format!("No tmux window named '{}' found", window_name))
 }
 
-/// Send a command to tmux window and wait for Claude to finish processing
+/// Send a command to the tmux window and wait for the interactive agent.
 pub async fn execute_command(config: &TmuxConfig, command_text: &str) -> Result<String, String> {
     let target = find_target(&config.window)?;
     info!("TMUX: Starting command execution in {}", target);
@@ -98,7 +177,7 @@ pub async fn execute_command(config: &TmuxConfig, command_text: &str) -> Result<
     }
     info!("TMUX: Enter keys sent, waiting for prompt");
 
-    // Step 3: Wait for [REPLY-ID] tags (Claude wraps response with matching ID)
+    // Step 3: Wait for [REPLY-ID] tags (the agent wraps its response with the matching ID)
     // Extract the ID from the command text (format: [CMD-XXXX]...[/CMD-XXXX])
     let cmd_id = if let Some(start) = command_text.find("[CMD-") {
         if let Some(end) = command_text[start + 5..].find("]") {
@@ -197,7 +276,7 @@ fn send_keys_key(target: &str, key: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Heuristic for "Claude has finished rendering this turn". Claude Code shows
+/// Heuristic for "the agent has finished rendering this turn". The TUI shows
 /// "(esc to interrupt)" next to its live spinner while a turn is running; its
 /// absence means the turn is done. Glyph-independent, so it survives spinner
 /// wording changes (Crunched/Churned/Brewed/…).
@@ -224,7 +303,7 @@ fn capture_pane(target: &str) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
-/// Wait for [REPLY-ID] tags in the output (Claude wraps response with matching ID)
+/// Wait for [REPLY-ID] tags in the output.
 async fn wait_for_reply_tags(target: &str, cmd_id: &str, timeout_secs: u64, poll_interval_ms: u64) -> Result<String, String> {
     let start = Instant::now();
     let timeout = Duration::from_secs(timeout_secs);
@@ -433,6 +512,22 @@ fn extract_output(raw_output: &str, command_sent: &str, prompt: &str) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn interactive_command_loads_bash_aliases() {
+        assert_eq!(
+            interactive_bash_command("codex --yolo"),
+            "exec bash -ic 'codex --yolo'"
+        );
+    }
+
+    #[test]
+    fn interactive_command_preserves_single_quotes() {
+        assert_eq!(
+            interactive_bash_command("agent --name 'sink master'"),
+            "exec bash -ic 'agent --name '\"'\"'sink master'\"'\"''"
+        );
+    }
 
     #[test]
     fn test_strip_ansi_codes() {
