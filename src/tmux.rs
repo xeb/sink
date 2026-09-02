@@ -5,6 +5,8 @@ use std::time::{Duration, Instant};
 use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
 
+const MASTER_SESSION: &str = "MASTER";
+
 /// Consecutive idle polls (no live spinner) required before accepting a reply
 /// whose `[REPLY-id]` opener is present but whose `[/REPLY-id]` closer Claude
 /// dropped. At the default 200ms poll interval this is ~0.6s of confirmation,
@@ -47,6 +49,75 @@ fn interactive_bash_command(command: &str) -> String {
     format!("exec bash -ic {}", shell_quote(command))
 }
 
+fn master_target(window_name: &str) -> String {
+    format!("{MASTER_SESSION}:{window_name}")
+}
+
+fn master_window_exists(window_name: &str) -> Result<bool, String> {
+    let output = Command::new("tmux")
+        .args(["list-windows", "-t", "=MASTER", "-F", "#{window_name}"])
+        .output()
+        .map_err(|e| format!("Failed to list tmux windows: {e}"))?;
+
+    if !output.status.success() {
+        return Ok(false);
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .any(|window| window == window_name))
+}
+
+fn create_master_window(
+    window_name: &str,
+    working_dir: &str,
+    shell_command: &str,
+) -> Result<String, String> {
+    let session = Command::new("tmux")
+        .args(["has-session", "-t", "=MASTER"])
+        .output()
+        .map_err(|e| format!("Failed to check tmux session {MASTER_SESSION}: {e}"))?;
+
+    let mut tmux = Command::new("tmux");
+    if session.status.success() {
+        tmux.args([
+            "new-window",
+            "-d",
+            "-t",
+            "MASTER:",
+            "-n",
+            window_name,
+            "-c",
+            working_dir,
+        ]);
+    } else {
+        tmux.args([
+            "new-session",
+            "-d",
+            "-s",
+            MASTER_SESSION,
+            "-n",
+            window_name,
+            "-c",
+            working_dir,
+        ]);
+    }
+
+    let output = tmux
+        .arg(shell_command)
+        .output()
+        .map_err(|e| format!("Failed to create tmux window {window_name}: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "tmux window creation failed for {}: {}",
+            master_target(window_name),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    Ok(master_target(window_name))
+}
+
 /// Restart the target pane with the configured interactive agent command.
 ///
 /// Bash is deliberately interactive here: the local `codex --yolo` wrapper is
@@ -62,9 +133,21 @@ pub fn restart_agent(config: &TmuxConfig, working_dir: &Path) -> Result<(), Stri
         return Err("Tmux restart command cannot be empty".to_string());
     }
 
-    let target = find_target(&config.window)?;
+    let working_dir = working_dir.to_str().ok_or_else(|| {
+        format!(
+            "Tmux working directory is not valid UTF-8: {:?}",
+            working_dir
+        )
+    })?;
+    let shell_command = interactive_bash_command(command);
+    let window_exists = master_window_exists(&config.window)?;
+    let target = if window_exists {
+        master_target(&config.window)
+    } else {
+        create_master_window(&config.window, working_dir, &shell_command)?
+    };
     info!(
-        "TMUX: Respawning {} in {:?} with interactive command: {}",
+        "TMUX: Starting {} in {:?} with interactive command: {}",
         target, working_dir, command
     );
 
@@ -80,13 +163,11 @@ pub fn restart_agent(config: &TmuxConfig, working_dir: &Path) -> Result<(), Stri
         ));
     }
 
-    let shell_command = interactive_bash_command(command);
-    let working_dir = working_dir.to_str().ok_or_else(|| {
-        format!(
-            "Tmux working directory is not valid UTF-8: {:?}",
-            working_dir
-        )
-    })?;
+    if !window_exists {
+        info!("TMUX: Created {} successfully", target);
+        return Ok(());
+    }
+
     let output = Command::new("tmux")
         .args([
             "respawn-pane",
@@ -112,28 +193,16 @@ pub fn restart_agent(config: &TmuxConfig, working_dir: &Path) -> Result<(), Stri
     Ok(())
 }
 
-/// Find the tmux target (session:window) by searching all sessions for the named window
+/// Find the named window in the dedicated MASTER session.
 fn find_target(window_name: &str) -> Result<String, String> {
-    let output = Command::new("tmux")
-        .args(&["list-windows", "-a", "-F", "#{session_name}:#{window_name}"])
-        .output()
-        .map_err(|e| format!("Failed to list tmux windows: {}", e))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("tmux list-windows failed: {}", stderr));
+    if master_window_exists(window_name)? {
+        return Ok(master_target(window_name));
     }
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    for line in stdout.lines() {
-        if let Some((_session, window)) = line.split_once(':') {
-            if window == window_name {
-                return Ok(line.to_string());
-            }
-        }
-    }
-
-    Err(format!("No tmux window named '{}' found", window_name))
+    Err(format!(
+        "No tmux window named '{}' found in session {}",
+        window_name, MASTER_SESSION
+    ))
 }
 
 /// Send a command to the tmux window and wait for the interactive agent.
