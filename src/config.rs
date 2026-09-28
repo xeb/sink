@@ -192,6 +192,14 @@ pub struct TmuxConfigSection {
     /// ~/.bash_aliases are available.
     #[serde(default)]
     pub restart_command: Option<String>,
+    /// Command typed into the primary agent after it is ready. This is not run
+    /// for the fallback agent.
+    #[serde(default)]
+    pub startup_command: Option<String>,
+    /// If the primary agent reports an exhausted usage quota, replace its tmux
+    /// window with this command and retry the interrupted message once.
+    #[serde(default)]
+    pub fallback_command: Option<String>,
     #[serde(default = "default_tmux_prompt")]
     pub prompt: String,
     #[serde(default = "default_tmux_timeout")]

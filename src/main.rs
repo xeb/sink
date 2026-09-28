@@ -9,6 +9,7 @@ mod followups;
 mod gemini;
 mod gmail;
 mod poller;
+mod recovery;
 mod scheduler;
 mod sender;
 mod tmux;
@@ -192,11 +193,14 @@ async fn main() -> Result<()> {
     let tmux_config = config.tmux.as_ref().map(|t| TmuxConfig {
         window: t.window.clone(),
         restart_command: t.restart_command.clone(),
+        startup_command: t.startup_command.clone(),
+        fallback_command: t.fallback_command.clone(),
         prompt: t.prompt.clone(),
         timeout_secs: t.timeout_secs,
         extended_timeout_secs: t.extended_timeout_secs,
         capture_lines: t.capture_lines,
         capture_interval_ms: t.capture_interval_ms,
+        fallback_active: Arc::new(AtomicBool::new(false)),
     });
 
     if use_tmux {
@@ -207,9 +211,18 @@ async fn main() -> Result<()> {
             .as_ref()
             .filter(|tc| tc.restart_command.is_some())
         {
-            crate::tmux::restart_agent(tc, &config.claude.working_dir).map_err(|e| {
-                SinkError::Config(format!("Failed to restart tmux agent: {}", e))
-            })?;
+            if recovery::has_pending(&db, &tc.window)?
+                && crate::tmux::master_window_exists(&tc.window).map_err(SinkError::Config)?
+            {
+                info!("Preserving tmux agent and scrollback: undelivered replies are still pending");
+            } else {
+                crate::tmux::restart_agent(tc, &config.claude.working_dir).map_err(|e| {
+                    SinkError::Config(format!("Failed to restart tmux agent: {}", e))
+                })?;
+                crate::tmux::run_startup_command(tc).await.map_err(|e| {
+                    SinkError::Config(format!("Failed to initialize tmux agent: {}", e))
+                })?;
+            }
         }
     } else {
         info!("Claude mode enabled (no [tmux] config section found)");
@@ -234,6 +247,16 @@ async fn main() -> Result<()> {
         info!("Received shutdown signal");
         r.store(false, Ordering::SeqCst);
     });
+
+    let reply_delivery_lock = Arc::new(tokio::sync::Mutex::new(()));
+    if let Some(tc) = tmux_config.clone() {
+        tokio::spawn(recovery::run(
+            config.clone(),
+            tc,
+            running.clone(),
+            reply_delivery_lock.clone(),
+        ));
+    }
 
     // Spawn notification scheduler (if notifications enabled)
     if let Some(ref notif_config) = config.notifications {
@@ -557,9 +580,7 @@ async fn main() -> Result<()> {
         // contacts instance). Cached in-memory across messages.
         let from_name = contact_resolver.resolve(&msg.sender).await;
 
-        // Set when the user has already been told about a primary timeout, so the
-        // error path below doesn't send a second message if the extended wait also fails.
-        let mut timeout_notified = false;
+        let mut tmux_reply_id = None;
 
         // Execute command via tmux or Claude depending on configuration
         let execution_result = if use_tmux {
@@ -567,8 +588,8 @@ async fn main() -> Result<()> {
             if let Some(ref tc) = tmux_config {
                 debug!("Using TMUX mode for message: {}", msg.text);
 
-                // Generate a 4-character random ID to uniquely identify this command/reply pair
-                let id = uuid::Uuid::new_v4().to_string()[0..4].to_string();
+                // IDs must stay unique across the lifetime of the durable queue.
+                let id = uuid::Uuid::new_v4().simple().to_string();
 
                 // Daemon metadata goes as bracketed tokens AFTER the pristine [CMD-id]
                 // opening tag (and before the user text), so id extraction — the first ']'
@@ -585,6 +606,14 @@ async fn main() -> Result<()> {
                     meta.push_str(&format!("[link={}]", url));
                 }
                 let wrapped = format!("[CMD-{}]{}{}[/CMD-{}]", id, meta, msg.text, id);
+                if let Err(e) = recovery::register(&db, &id, &tc.window, &msg.chat_guid, &batch_guids) {
+                    error!("Cannot persist tmux request; command was not sent: {}", e);
+                    for guid in &batch_guids {
+                        let _ = db.update_status(guid, "pending");
+                    }
+                    continue;
+                }
+                tmux_reply_id = Some(id.clone());
                 info!("TMUX: Sending wrapped command with ID: {} (from={}, name={:?}, {} attachment(s), link={})",
                     id, msg.sender, from_name, attachment_paths.len(), link.is_some());
 
@@ -609,16 +638,21 @@ async fn main() -> Result<()> {
                             "TMUX: Continuing to listen for [REPLY-{}] for up to {}s more",
                             id, tc.extended_timeout_secs
                         );
-                        match crate::tmux::wait_for_reply(tc, &id, tc.extended_timeout_secs).await {
+                        match crate::tmux::wait_for_reply(
+                            tc,
+                            &id,
+                            &wrapped,
+                            tc.extended_timeout_secs,
+                        )
+                        .await
+                        {
                             Ok(output) => {
                                 info!("TMUX: Reply for {} arrived during extended wait", id);
                                 extract_reply(&output, &id).map(|c| (c, None::<String>))
                             }
                             Err(e2) => {
-                                error!("TMUX extended wait timed out for {}: {}", id, e2);
-                                // User was already notified at the primary timeout.
-                                timeout_notified = true;
-                                Err(format!("TMUX extended timeout: {}", e2))
+                                warn!("TMUX foreground wait ended for {}; background recovery will keep checking: {}", id, e2);
+                                Err(format!("Waiting for a late reply; checking every five minutes: {}", e2))
                             }
                         }
                     }
@@ -692,18 +726,24 @@ async fn main() -> Result<()> {
 
                 // Send response
                 info!("Sending response via iMessage: {} chars", response_text.len());
-                match sender
-                    .send_with_retry(&msg.chat_guid, &response_text, 10)
-                    .await
-                {
+                let send_result = if let Some(ref id) = tmux_reply_id {
+                    recovery::deliver(
+                        &config.database.path, id, Some(&response_text), &sender, &reply_delivery_lock,
+                    ).await
+                } else {
+                    sender.send_with_retry(&msg.chat_guid, &response_text, 10).await
+                };
+                match send_result {
                     Ok(response_guid) => {
-                        for guid in &batch_guids {
-                            if let Err(e) = db.mark_processed(
-                                guid,
-                                response_guid.as_deref(),
-                                session_id_opt.as_deref(),
-                            ) {
-                                error!("Failed to mark as processed: {}", e);
+                        if tmux_reply_id.is_none() {
+                            for guid in &batch_guids {
+                                if let Err(e) = db.mark_processed(
+                                    guid,
+                                    response_guid.as_deref(),
+                                    session_id_opt.as_deref(),
+                                ) {
+                                    error!("Failed to mark as processed: {}", e);
+                                }
                             }
                         }
                         info!("Successfully processed and responded to message");
@@ -800,8 +840,14 @@ async fn main() -> Result<()> {
                     Err(e) => {
                         error!("Failed to send response: {}", e);
                         let reason = format!("Failed to send response: {}", e);
-                        for guid in &batch_guids {
-                            let _ = db.mark_failed(guid, &reason);
+                        if let Some(ref id) = tmux_reply_id {
+                            if let Err(e) = recovery::defer(&db, id, &reason) {
+                                error!("Failed to defer reply delivery: {}", e);
+                            }
+                        } else {
+                            for guid in &batch_guids {
+                                let _ = db.mark_failed(guid, &reason);
+                            }
                         }
                     }
                 }
@@ -809,14 +855,9 @@ async fn main() -> Result<()> {
             Err(e) => {
                 error!("Command execution failed: {}", e);
 
-                if timeout_notified {
-                    // The user was already told at the primary timeout and the extended
-                    // wait still produced nothing — don't send a second message.
-                    info!("Suppressing duplicate error message (user already notified at primary timeout)");
-                    for guid in &batch_guids {
-                        if let Err(err) = db.mark_processed(guid, None, None) {
-                            error!("Failed to mark as processed: {}", err);
-                        }
+                if let Some(ref id) = tmux_reply_id {
+                    if let Err(err) = recovery::defer(&db, id, &e) {
+                        error!("Failed to record pending late reply: {}", err);
                     }
                 } else {
                     // Send error response to user

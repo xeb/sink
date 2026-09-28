@@ -102,6 +102,8 @@ impl Database {
             self.conn.execute("ALTER TABLE messages ADD COLUMN error_reason TEXT", [])?;
         }
 
+        crate::recovery::init(&self.conn)?;
+
         Ok(())
     }
 
@@ -339,7 +341,7 @@ impl Database {
     /// Returns the number of messages recovered
     pub fn recover_stuck_processing(&self) -> Result<usize> {
         let count = self.conn.execute(
-            "UPDATE messages SET status = 'pending' WHERE status = 'processing'",
+            "UPDATE messages SET status = CASE WHEN tmux_command_id IS NULL THEN 'pending' ELSE 'awaiting_reply' END WHERE status = 'processing'",
             [],
         )?;
         Ok(count)

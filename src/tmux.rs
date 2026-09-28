@@ -1,6 +1,8 @@
 use regex::Regex;
 use std::path::Path;
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
@@ -17,11 +19,14 @@ const IDLE_CONFIRM_POLLS: u32 = 3;
 pub struct TmuxConfig {
     pub window: String,                  // Window name (e.g., "sink MASTER")
     pub restart_command: Option<String>, // Command used to respawn the pane at daemon startup
+    pub startup_command: Option<String>, // Typed after the primary agent is ready
+    pub fallback_command: Option<String>, // Replaces the window when primary quota is exhausted
     pub prompt: String,                  // Prompt string (e.g., "❯")
     pub timeout_secs: u64,               // Primary wait before notifying the user (default: 90)
     pub extended_timeout_secs: u64, // Extra wait after the notice, for a slow reply (default: 600)
     pub capture_lines: usize,       // Max lines to capture (default: 200)
     pub capture_interval_ms: u64,   // Poll interval (default: 200)
+    pub(crate) fallback_active: Arc<AtomicBool>,
 }
 
 impl Default for TmuxConfig {
@@ -29,13 +34,50 @@ impl Default for TmuxConfig {
         TmuxConfig {
             window: "sink MASTER".to_string(),
             restart_command: None,
+            startup_command: None,
+            fallback_command: None,
             prompt: "❯".to_string(),
             timeout_secs: 90,
             extended_timeout_secs: 600,
             capture_lines: 200,
             capture_interval_ms: 200,
+            fallback_active: Arc::new(AtomicBool::new(false)),
         }
     }
+}
+
+impl TmuxConfig {
+    /// Codex streams its final answer after removing the TUI's live-spinner text,
+    /// so the Claude-specific idle fallback can truncate a reply mid-render.
+    /// Sink owns the pane startup command, which gives us a reliable distinction
+    /// for the supported `codex ...` and `claude ...` configurations.
+    fn requires_closing_reply_tag(&self) -> bool {
+        self.active_command()
+            .as_deref()
+            .and_then(configured_program)
+            .is_some_and(|program| program == "codex")
+    }
+
+    fn active_command(&self) -> Option<&str> {
+        if self.fallback_active.load(Ordering::SeqCst) {
+            self.fallback_command.as_deref()
+        } else {
+            self.restart_command.as_deref()
+        }
+    }
+}
+
+/// Return the executable name from the configured interactive-shell command.
+/// Allow leading `exec`, `env`, and environment assignments, which are common in
+/// service configuration, while keeping the detection conservative.
+fn configured_program(command: &str) -> Option<&str> {
+    command
+        .split_ascii_whitespace()
+        .map(|token| token.trim_matches(['\'', '"']))
+        .filter(|token| *token != "exec" && *token != "env" && !token.contains('='))
+        .next()
+        .and_then(|token| Path::new(token).file_name())
+        .and_then(|name| name.to_str())
 }
 
 /// Quote one argument for a POSIX shell. tmux executes its `shell-command`
@@ -53,7 +95,7 @@ fn master_target(window_name: &str) -> String {
     format!("{MASTER_SESSION}:{window_name}")
 }
 
-fn master_window_exists(window_name: &str) -> Result<bool, String> {
+pub fn master_window_exists(window_name: &str) -> Result<bool, String> {
     let output = Command::new("tmux")
         .args(["list-windows", "-t", "=MASTER", "-F", "#{window_name}"])
         .output()
@@ -125,6 +167,7 @@ fn create_master_window(
 /// shells. `remain-on-exit` keeps the named pane available for a later daemon
 /// restart even if the agent exits immediately.
 pub fn restart_agent(config: &TmuxConfig, working_dir: &Path) -> Result<(), String> {
+    config.fallback_active.store(false, Ordering::SeqCst);
     let command = config
         .restart_command
         .as_deref()
@@ -193,6 +236,26 @@ pub fn restart_agent(config: &TmuxConfig, working_dir: &Path) -> Result<(), Stri
     Ok(())
 }
 
+/// Type the configured initialization command once the freshly started primary
+/// agent has drawn its UI. The fallback deliberately skips this step.
+pub async fn run_startup_command(config: &TmuxConfig) -> Result<(), String> {
+    let Some(command) = config.startup_command.as_deref() else {
+        return Ok(());
+    };
+    if command.trim().is_empty() {
+        return Err("Tmux startup command cannot be empty".to_string());
+    }
+
+    let target = find_target(&config.window)?;
+    wait_for_agent_ui(&target, 15).await?;
+    info!("TMUX: Sending primary-agent startup command: {}", command);
+    exit_pane_mode(&target);
+    send_keys_literal(&target, command)?;
+    send_keys_key(&target, "Enter")?;
+    sleep(Duration::from_millis(500)).await;
+    Ok(())
+}
+
 /// Find the named window in the dedicated MASTER session.
 fn find_target(window_name: &str) -> Result<String, String> {
     if master_window_exists(window_name)? {
@@ -207,6 +270,19 @@ fn find_target(window_name: &str) -> Result<String, String> {
 
 /// Send a command to the tmux window and wait for the interactive agent.
 pub async fn execute_command(config: &TmuxConfig, command_text: &str) -> Result<String, String> {
+    execute_or_fallback(config, command_text, None).await
+}
+
+async fn execute_or_fallback(
+    config: &TmuxConfig,
+    command_text: &str,
+    cmd_id: Option<&str>,
+) -> Result<String, String> {
+    // A call from the extended-wait path has already notified the user, so give
+    // a newly launched fallback the full extended interval for its retry.
+    let mut retry_after_fallback =
+        cmd_id.is_some() && config.fallback_active.load(Ordering::SeqCst);
+    loop {
     let target = find_target(&config.window)?;
     info!("TMUX: Starting command execution in {}", target);
 
@@ -248,7 +324,7 @@ pub async fn execute_command(config: &TmuxConfig, command_text: &str) -> Result<
 
     // Step 3: Wait for [REPLY-ID] tags (the agent wraps its response with the matching ID)
     // Extract the ID from the command text (format: [CMD-XXXX]...[/CMD-XXXX])
-    let cmd_id = if let Some(start) = command_text.find("[CMD-") {
+    let parsed_cmd_id = if let Some(start) = command_text.find("[CMD-") {
         if let Some(end) = command_text[start + 5..].find("]") {
             command_text[start + 5..start + 5 + end].to_string()
         } else {
@@ -258,13 +334,40 @@ pub async fn execute_command(config: &TmuxConfig, command_text: &str) -> Result<
         return Err("Command missing [CMD-ID] format".to_string());
     };
 
+    let cmd_id = cmd_id.unwrap_or(&parsed_cmd_id);
+    let timeout_secs = if retry_after_fallback {
+        config.extended_timeout_secs
+    } else {
+        config.timeout_secs
+    };
     info!("TMUX: Waiting for [REPLY-{}] tags (timeout: {}s, poll interval: {}ms)",
-        cmd_id, config.timeout_secs, config.capture_interval_ms);
-    let result = wait_for_reply_tags(&target, &cmd_id, config.timeout_secs, config.capture_interval_ms).await?;
-    info!("TMUX: [REPLY-{}] tags detected, returning output: {} chars", cmd_id, result.len());
+        cmd_id, timeout_secs, config.capture_interval_ms);
+    match wait_for_reply_tags(
+        &target,
+        &cmd_id,
+        timeout_secs,
+        config.capture_interval_ms,
+        config.requires_closing_reply_tag(),
+    )
+    .await {
+        Ok(result) => {
+            info!("TMUX: [REPLY-{}] tags detected, returning output: {} chars", cmd_id, result.len());
+            return Ok(result);
+        }
+        Err(WaitError::UsageLimit) if !config.fallback_active.load(Ordering::SeqCst) => {
+            replace_with_fallback(config)?;
+            retry_after_fallback = true;
+            wait_for_agent_ui(&find_target(&config.window)?, 15).await?;
+            info!("TMUX: Retrying [CMD-{}] in fallback agent", cmd_id);
+            continue;
+        }
+        Err(WaitError::UsageLimit) => {
+            return Err("Fallback agent also reported a usage limit".to_string());
+        }
+        Err(WaitError::Other(error)) => return Err(error),
+    }
 
-    // Return the raw output - caller extracts [REPLY-ID]...[/REPLY-ID] content
-    Ok(result)
+    }
 }
 
 /// Keep listening for [REPLY-ID] tags after the command was already sent and the
@@ -273,6 +376,7 @@ pub async fn execute_command(config: &TmuxConfig, command_text: &str) -> Result<
 pub async fn wait_for_reply(
     config: &TmuxConfig,
     cmd_id: &str,
+    command_text: &str,
     timeout_secs: u64,
 ) -> Result<String, String> {
     let target = find_target(&config.window)?;
@@ -280,7 +384,118 @@ pub async fn wait_for_reply(
         "TMUX: Extended wait for [REPLY-{}] (up to {}s more)",
         cmd_id, timeout_secs
     );
-    wait_for_reply_tags(&target, cmd_id, timeout_secs, config.capture_interval_ms).await
+    match wait_for_reply_tags(
+        &target,
+        cmd_id,
+        timeout_secs,
+        config.capture_interval_ms,
+        config.requires_closing_reply_tag(),
+    )
+    .await {
+        Ok(output) => Ok(output),
+        Err(WaitError::UsageLimit) if !config.fallback_active.load(Ordering::SeqCst) => {
+            replace_with_fallback(config)?;
+            wait_for_agent_ui(&find_target(&config.window)?, 15).await?;
+            execute_or_fallback(config, command_text, Some(cmd_id)).await
+        }
+        Err(WaitError::UsageLimit) => Err("Fallback agent also reported a usage limit".to_string()),
+        Err(WaitError::Other(error)) => Err(error),
+    }
+}
+
+#[derive(Debug)]
+enum WaitError {
+    UsageLimit,
+    Other(String),
+}
+
+fn usage_limit_hit(content: &str) -> bool {
+    let lower = content.to_ascii_lowercase();
+    (lower.contains("individual quota reached")
+        && (lower.contains("please upgrade your subscription") || lower.contains("resets in")))
+        || lower.contains("you've hit your usage limit")
+        || lower.contains("you have hit your usage limit")
+        || lower.contains("usage quota exceeded")
+}
+
+fn pane_working_dir(target: &str) -> Result<String, String> {
+    let output = Command::new("tmux")
+        .args(["display-message", "-p", "-t", target, "#{pane_current_path}"])
+        .output()
+        .map_err(|e| format!("Failed to read tmux pane working directory: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "tmux display-message failed for {}: {}",
+            target,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn replace_with_fallback(config: &TmuxConfig) -> Result<(), String> {
+    let command = config
+        .fallback_command
+        .as_deref()
+        .ok_or_else(|| "Primary agent hit its usage limit and no fallback command is configured".to_string())?;
+    let target = find_target(&config.window)?;
+    let working_dir = pane_working_dir(&target)?;
+    warn!("TMUX: Primary agent usage limit detected; replacing {} with fallback: {}", target, command);
+
+    let killed = Command::new("tmux")
+        .args(["kill-window", "-t", &target])
+        .output()
+        .map_err(|e| format!("Failed to close exhausted tmux window {}: {e}", target))?;
+    if !killed.status.success() {
+        return Err(format!(
+            "tmux kill-window failed for {}: {}",
+            target,
+            String::from_utf8_lossy(&killed.stderr).trim()
+        ));
+    }
+
+    create_master_window(
+        &config.window,
+        &working_dir,
+        &interactive_bash_command(command),
+    )?;
+    config.fallback_active.store(true, Ordering::SeqCst);
+    info!("TMUX: Created fallback window {}", master_target(&config.window));
+    Ok(())
+}
+
+async fn wait_for_agent_ui(target: &str, timeout_secs: u64) -> Result<(), String> {
+    let start = Instant::now();
+    let mut trust_confirmed = false;
+    while start.elapsed() < Duration::from_secs(timeout_secs) {
+        let content = capture_visible_pane(target)?;
+        if !trust_confirmed && content.contains("Do you trust the contents of this project?") {
+            info!("TMUX: Confirming configured working directory for unattended agent");
+            send_keys_key(target, "Enter")?;
+            trust_confirmed = true;
+            sleep(Duration::from_millis(200)).await;
+            continue;
+        }
+        if content.contains("for shortcuts") || content.contains("OpenAI Codex") {
+            return Ok(());
+        }
+        sleep(Duration::from_millis(200)).await;
+    }
+    Err(format!("Timed out waiting for agent UI in {}", target))
+}
+
+fn capture_visible_pane(target: &str) -> Result<String, String> {
+    let output = Command::new("tmux")
+        .args(["capture-pane", "-t", target, "-p", "-J"])
+        .output()
+        .map_err(|e| format!("Failed to capture visible tmux pane: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "tmux capture-pane failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
 /// Drop the target pane out of any tmux mode so send-keys reaches the program.
@@ -372,8 +587,27 @@ fn capture_pane(target: &str) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
+/// Read-only capture of all retained history for the five-minute recovery scan.
+pub fn capture_reply_history(config: &TmuxConfig) -> Result<String, String> {
+    let target = find_target(&config.window)?;
+    let output = Command::new("tmux")
+        .args(["capture-pane", "-t", &target, "-p", "-J", "-S", "-"])
+        .output()
+        .map_err(|e| format!("Failed to capture reply history: {e}"))?;
+    if !output.status.success() {
+        return Err(format!("Reply history capture failed: {}", String::from_utf8_lossy(&output.stderr)));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
 /// Wait for [REPLY-ID] tags in the output.
-async fn wait_for_reply_tags(target: &str, cmd_id: &str, timeout_secs: u64, poll_interval_ms: u64) -> Result<String, String> {
+async fn wait_for_reply_tags(
+    target: &str,
+    cmd_id: &str,
+    timeout_secs: u64,
+    poll_interval_ms: u64,
+    require_closing_tag: bool,
+) -> Result<String, WaitError> {
     let start = Instant::now();
     let timeout = Duration::from_secs(timeout_secs);
     let poll_interval = Duration::from_millis(poll_interval_ms);
@@ -383,9 +617,19 @@ async fn wait_for_reply_tags(target: &str, cmd_id: &str, timeout_secs: u64, poll
 
     let mut poll_count = 0;
     let mut idle_with_opener = 0u32;
+    if require_closing_tag {
+        info!(
+            "TMUX: Codex reply policy active for [REPLY-{}]; matching closing tag is required",
+            cmd_id
+        );
+    }
     loop {
         poll_count += 1;
-        let content = capture_pane(target)?;
+        let content = capture_pane(target).map_err(WaitError::Other)?;
+
+        if usage_limit_hit(&capture_visible_pane(target).map_err(WaitError::Other)?) {
+            return Err(WaitError::UsageLimit);
+        }
 
         let has_open = content.contains(&reply_start_tag);
         let has_close = content.contains(&reply_end_tag);
@@ -396,12 +640,12 @@ async fn wait_for_reply_tags(target: &str, cmd_id: &str, timeout_secs: u64, poll
             return Ok(content);
         }
 
-        // Recovery path: opener present, closer missing. If Claude has gone idle
+        // Claude recovery path: opener present, closer missing. If Claude has gone idle
         // (no live "esc to interrupt" spinner) for several consecutive polls, the
         // model almost certainly dropped the closing tag — accept the response
         // now rather than waiting out the full timeout on a complete, on-screen
         // answer. extract_reply() recovers the body up to the first TUI boundary.
-        if has_open {
+        if has_open && !require_closing_tag {
             if pane_is_idle(&content) {
                 idle_with_opener += 1;
                 if idle_with_opener >= IDLE_CONFIRM_POLLS {
@@ -422,10 +666,10 @@ async fn wait_for_reply_tags(target: &str, cmd_id: &str, timeout_secs: u64, poll
                 "Timed out waiting for [REPLY-{}] tags after {} seconds ({} polls)",
                 cmd_id, timeout_secs, poll_count
             );
-            return Err(format!(
+            return Err(WaitError::Other(format!(
                 "Timed out waiting for [REPLY-{}] tags after {} seconds",
                 cmd_id, timeout_secs
-            ));
+            )));
         }
 
         if poll_count % 10 == 0 {
@@ -596,6 +840,72 @@ mod tests {
             interactive_bash_command("agent --name 'sink master'"),
             "exec bash -ic 'agent --name '\"'\"'sink master'\"'\"''"
         );
+    }
+
+    #[test]
+    fn codex_requires_a_closing_reply_tag() {
+        let config = TmuxConfig {
+            restart_command: Some("codex --yolo".to_string()),
+            ..TmuxConfig::default()
+        };
+
+        assert!(config.requires_closing_reply_tag());
+    }
+
+    #[test]
+    fn codex_path_and_shell_prefix_require_a_closing_reply_tag() {
+        let config = TmuxConfig {
+            restart_command: Some(
+                "exec env CODEX_MODE=sink /usr/local/bin/codex --yolo".to_string(),
+            ),
+            ..TmuxConfig::default()
+        };
+
+        assert!(config.requires_closing_reply_tag());
+    }
+
+    #[test]
+    fn claude_keeps_the_missing_closer_fallback() {
+        for restart_command in [
+            None,
+            Some("claude --dangerously-skip-permissions".to_string()),
+        ] {
+            let config = TmuxConfig {
+                restart_command,
+                ..TmuxConfig::default()
+            };
+
+            assert!(!config.requires_closing_reply_tag());
+        }
+    }
+
+    #[test]
+    fn recognizes_antigravity_quota_banner_without_matching_limit_conversation() {
+        assert!(usage_limit_hit(
+            "⚠ Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 146h."
+        ));
+        assert!(!usage_limit_hit(
+            "[CMD-abcd]Can you explain individual quota limits?[/CMD-abcd]"
+        ));
+        assert!(!usage_limit_hit(
+            "A checked bag may avoid the carry-on liquid limit."
+        ));
+    }
+
+    #[test]
+    fn fallback_switches_reply_policy_without_changing_startup_command() {
+        let config = TmuxConfig {
+            restart_command: Some("agy --yolo".to_string()),
+            startup_command: Some("/effort low".to_string()),
+            fallback_command: Some("codex --yolo".to_string()),
+            ..TmuxConfig::default()
+        };
+
+        assert!(!config.requires_closing_reply_tag());
+        assert_eq!(config.startup_command.as_deref(), Some("/effort low"));
+        config.fallback_active.store(true, Ordering::SeqCst);
+        assert!(config.requires_closing_reply_tag());
+        assert_eq!(config.startup_command.as_deref(), Some("/effort low"));
     }
 
     #[test]

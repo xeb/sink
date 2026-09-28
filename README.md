@@ -36,7 +36,8 @@ Instead of spawning a new subprocess for each message, **Sink injects commands d
 
 - **iMessage Bridge**: Receives messages via BlueBubbles API, sends responses back
 - **Interactive Codex**: Commands execute in a real Codex session (not subprocess spawning)
-- **Unique ID Tagging**: Each command gets a 4-character ID—responses are matched by ID, never by buffer position
+- **Unique ID Tagging**: Each command gets a UUID—responses are matched by ID, never by buffer position
+- **Late Reply Recovery**: A persistent outbox checks every five minutes for undelivered tmux replies, with no expiration
 - **Group Chat Filtering**: Uses Gemini to detect if messages are directed at Claude
 - **Web Admin Panel**: Monitor messages, transcripts, and costs at port 1111
 - **Context Awareness**: Maintains conversation history for better responses
@@ -61,8 +62,9 @@ share the same project guidance:
 ln -s ~/m/CLAUDE.md ~/m/AGENTS.md
 ```
 
-Create the named window once. Sink will respawn its pane with the configured
-command whenever the daemon starts:
+Create the named window once. Sink respawns its pane with the configured
+command when the daemon starts, unless outstanding replies require preserving
+the existing agent and its scrollback:
 
 ```bash
 tmux new-session -s main -n "sink MASTER"
@@ -101,10 +103,10 @@ password = "YOUR_BB_PASSWORD"
 
 [tmux]
 window = "sink MASTER"           # Your tmux window name
-restart_command = "codex --yolo" # Loaded through interactive Bash / ~/.bash_aliases
+restart_command = "codex --yolo"   # Loaded through interactive Bash / ~/.bash_aliases
 prompt = "›"                     # Codex's prompt character
-timeout_secs = 300              # Max wait time for responses
-extended_timeout_secs = 600     # Extra wait after the timeout notice
+timeout_secs = 300              # Send a progress notice after this wait
+extended_timeout_secs = 600     # Extra foreground wait before background recovery takes over
 capture_interval_ms = 200       # Poll frequency
 
 [polling]
@@ -205,10 +207,12 @@ identity-aware proxy before exposing it beyond your machine.
 | Setting | Description | Default |
 |---------|-------------|---------|
 | `tmux.window` | tmux window name | `sink MASTER` |
-| `tmux.restart_command` | Respawn the pane with this interactive-Bash command at daemon startup | unset |
+| `tmux.restart_command` | Respawn at startup unless outstanding replies require preserving the existing pane | unset |
+| `tmux.startup_command` | Command sent after the primary agent UI is ready | unset |
+| `tmux.fallback_command` | Replacement agent command when the primary usage quota is exhausted | unset |
 | `tmux.prompt` | Interactive agent prompt character | `❯` |
 | `tmux.timeout_secs` | Primary wait for response | `90` |
-| `tmux.extended_timeout_secs` | Extra wait after the timeout notice | `600` |
+| `tmux.extended_timeout_secs` | Extra foreground wait before five-minute background recovery takes over | `600` |
 | `tmux.capture_interval_ms` | Poll frequency | `200` |
 | `polling.interval_secs` | Check messages every N seconds | `5` |
 | `polling.batch_window_secs` | Wait for message batching | `2` |
@@ -218,9 +222,30 @@ identity-aware proxy before exposing it beyond your machine.
 
 | Path | Content |
 |------|---------|
-| `/var/lib/sink/messages.db` | Message history and status |
+| `/var/lib/sink/messages.db` | Message history, status, and durable `tmux_replies` outbox |
 | `/var/lib/sink/transcripts.db` | Full session transcripts (if enabled) |
 | `/var/lib/sink/followups.db` | Scheduled notifications |
+
+### Late replies
+
+Sink saves each tmux command ID and its batched message GUIDs before sending the
+command. After the foreground waits end, undelivered messages remain
+`awaiting_reply` (shown under **waiting** in the panel). A separate task checks
+requests older than five minutes at startup and every five minutes thereafter,
+even while another command is running. There is no age or retry limit.
+
+Recovery reads all retained tmux scrollback for a complete matching
+`[REPLY-id]…[/REPLY-id]` pair and saves the answer before attempting delivery.
+Failed sends retry from the saved answer, including after daemon restarts. A
+successful API receipt records the outbound message and marks every input in
+the batch replied in one database transaction. The foreground sender and
+recovery task share a delivery lock to prevent duplicate sends during a run.
+
+Keep the tmux pane and its history available until an answer is captured; recovery
+cannot reconstruct output erased before a scan or an answer the agent never
+produced. An ambiguous network failure or a crash after BlueBubbles accepts a
+send but before Sink records its receipt can still cause a duplicate on retry;
+retries reuse the same `tempGuid` but do not assume server-side deduplication.
 
 ## Debugging
 

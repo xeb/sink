@@ -96,7 +96,7 @@ fn statuses_for_filter(filter: &str) -> Option<&'static [&'static str]> {
     match filter {
         "replied" => Some(&["replied"]),
         "failed" => Some(&["failed"]),
-        "waiting" => Some(&["pending", "processing"]),
+        "waiting" => Some(&["pending", "processing", "awaiting_reply"]),
         "ignored" => Some(&["not_for_claude", "skipped"]),
         _ => None,
     }
@@ -107,7 +107,7 @@ fn bucket_for_status(status: &str) -> &'static str {
     match status {
         "replied" => "replied",
         "failed" => "failed",
-        "pending" | "processing" => "waiting",
+        "pending" | "processing" | "awaiting_reply" => "waiting",
         _ => "ignored",
     }
 }
@@ -579,6 +579,7 @@ const STATUS = {
   failed:         { label: 'failed',  tone: 'failed'  },
   pending:        { label: 'waiting', tone: 'waiting' },
   processing:     { label: 'running', tone: 'waiting' },
+  awaiting_reply: { label: 'waiting for reply', tone: 'waiting' },
   skipped:        { label: 'skipped', tone: 'ignored' },
   not_for_claude: { label: 'ignored', tone: 'ignored' },
 };
@@ -637,7 +638,7 @@ function body(r) {
   if (r.status === 'failed') {
     return `<div class="note bad"><span class="lat">${esc(stamp)}</span>No reason recorded — this one failed before error tracking existed. Check <code>journalctl --user -u sink</code>.</div>`;
   }
-  if (r.status === 'pending' || r.status === 'processing') {
+  if (r.status === 'pending' || r.status === 'processing' || r.status === 'awaiting_reply') {
     return `<div class="note"><span class="lat">${esc(meta.label)}</span>No reply yet.</div>`;
   }
   return `<div class="note"><span class="lat">${esc(meta.label)}</span>No reply was sent.</div>`;
