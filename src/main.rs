@@ -323,6 +323,14 @@ async fn main() -> Result<()> {
     while running.load(Ordering::SeqCst) {
         poll_interval.tick().await;
 
+        // Repair a missing agent window even when there are no new messages.
+        // A failed repair must not prevent polling; retry on the next cycle.
+        if let Some(ref tc) = tmux_config {
+            if let Err(e) = crate::tmux::ensure_agent_window(tc, &config.claude.working_dir).await {
+                error!("Failed to ensure tmux agent window: {}", e);
+            }
+        }
+
         // Poll for new messages
         match poller.poll_and_store(&db, startup_time).await {
             Ok(new_messages) => {

@@ -18,7 +18,7 @@ const IDLE_CONFIRM_POLLS: u32 = 3;
 #[derive(Debug, Clone)]
 pub struct TmuxConfig {
     pub window: String,                  // Window name (e.g., "sink MASTER")
-    pub restart_command: Option<String>, // Command used to respawn the pane at daemon startup
+    pub restart_command: Option<String>, // Command used at startup and to recreate a missing window
     pub startup_command: Option<String>, // Typed after the primary agent is ready
     pub fallback_command: Option<String>, // Replaces the window when primary quota is exhausted
     pub prompt: String,                  // Prompt string (e.g., "❯")
@@ -108,6 +108,18 @@ pub fn master_window_exists(window_name: &str) -> Result<bool, String> {
     Ok(String::from_utf8_lossy(&output.stdout)
         .lines()
         .any(|window| window == window_name))
+}
+
+/// The polling fast path only checks for the window; leave existing agents and
+/// their scrollback alone, including an active fallback agent.
+pub async fn ensure_agent_window(config: &TmuxConfig, working_dir: &Path) -> Result<(), String> {
+    if config.restart_command.is_none() || master_window_exists(&config.window)? {
+        return Ok(());
+    }
+
+    warn!("TMUX: Window {} is missing; recreating it", master_target(&config.window));
+    restart_agent(config, working_dir)?;
+    run_startup_command(config).await
 }
 
 fn create_master_window(

@@ -188,6 +188,7 @@ pub struct TmuxConfigSection {
     #[serde(default = "default_tmux_window")]
     pub window: String,
     /// When set, sink respawns the target pane with this command at daemon startup.
+    /// Each message poll also recreates the window if it is missing.
     /// The command runs in an interactive Bash shell so functions and aliases from
     /// ~/.bash_aliases are available.
     #[serde(default)]

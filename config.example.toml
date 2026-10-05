@@ -32,11 +32,14 @@ message_history_count = 20  # Number of previous messages to include as context
 # Optional: inject messages into a persistent interactive agent in tmux.
 # When restart_command is set, sink respawns this pane at daemon startup unless
 # outstanding replies require preserving the existing agent and scrollback.
+# Each message poll recreates the window (and MASTER session) if missing.
 # It runs through interactive Bash so ~/.bash_aliases functions are available.
 # [tmux]
 # window = "sink MASTER"
-# restart_command = "codex --yolo"
-# prompt = "›"
+# restart_command = "agy --dangerously-skip-permissions"
+# prompt = ">"
+# For Codex, use "codex --yolo --no-alt-screen" and prompt = "›".
+# Codex inline mode preserves tmux scrollback so long replies remain capturable.
 # timeout_secs = 300             # Progress notice after this wait
 # extended_timeout_secs = 600    # Then check for late replies every five minutes, indefinitely
 # capture_lines = 200

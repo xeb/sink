@@ -103,8 +103,8 @@ password = "YOUR_BB_PASSWORD"
 
 [tmux]
 window = "sink MASTER"           # Your tmux window name
-restart_command = "codex --yolo"   # Loaded through interactive Bash / ~/.bash_aliases
-prompt = "›"                     # Codex's prompt character
+restart_command = "agy --dangerously-skip-permissions" # Loaded through interactive Bash
+prompt = ">"                     # agy's prompt character
 timeout_secs = 300              # Send a progress notice after this wait
 extended_timeout_secs = 600     # Extra foreground wait before background recovery takes over
 capture_interval_ms = 200       # Poll frequency
@@ -207,7 +207,7 @@ identity-aware proxy before exposing it beyond your machine.
 | Setting | Description | Default |
 |---------|-------------|---------|
 | `tmux.window` | tmux window name | `sink MASTER` |
-| `tmux.restart_command` | Respawn at startup unless outstanding replies require preserving the existing pane | unset |
+| `tmux.restart_command` | Respawn at startup unless outstanding replies require preserving the existing pane; recreate a missing window on each message poll | unset |
 | `tmux.startup_command` | Command sent after the primary agent UI is ready | unset |
 | `tmux.fallback_command` | Replacement agent command when the primary usage quota is exhausted | unset |
 | `tmux.prompt` | Interactive agent prompt character | `❯` |
@@ -236,6 +236,10 @@ even while another command is running. There is no age or retry limit.
 
 Recovery reads all retained tmux scrollback for a complete matching
 `[REPLY-id]…[/REPLY-id]` pair and saves the answer before attempting delivery.
+If using Codex instead of agy, start it with `codex --yolo --no-alt-screen`
+so replies are retained in tmux scrollback.
+In alternate-screen mode, a reply taller than the pane can hide its opening
+tag from both foreground capture and recovery, even with a large history limit.
 Failed sends retry from the saved answer, including after daemon restarts. A
 successful API receipt records the outbound message and marks every input in
 the batch replied in one database transaction. The foreground sender and
