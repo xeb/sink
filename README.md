@@ -228,6 +228,11 @@ identity-aware proxy before exposing it beyond your machine.
 
 ### Late replies
 
+Sink waits for the matching `[/REPLY-id]` tag before delivering replies from
+agy, Codex, or an unknown agent. Spinner text is not a completion signal for
+these agents. Only an explicitly configured Claude command uses the legacy
+idle fallback for a missing closing tag.
+
 Sink saves each tmux command ID and its batched message GUIDs before sending the
 command. After the foreground waits end, undelivered messages remain
 `awaiting_reply` (shown under **waiting** in the panel). A separate task checks

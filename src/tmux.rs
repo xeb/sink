@@ -47,15 +47,11 @@ impl Default for TmuxConfig {
 }
 
 impl TmuxConfig {
-    /// Codex streams its final answer after removing the TUI's live-spinner text,
-    /// so the Claude-specific idle fallback can truncate a reply mid-render.
-    /// Sink owns the pane startup command, which gives us a reliable distinction
-    /// for the supported `codex ...` and `claude ...` configurations.
+    /// Only explicitly configured Claude supports the legacy idle heuristic.
+    /// agy uses a different spinner, and Codex can hide its spinner before the
+    /// answer finishes rendering. Both (and unknown agents) need the closer.
     fn requires_closing_reply_tag(&self) -> bool {
-        self.active_command()
-            .as_deref()
-            .and_then(configured_program)
-            .is_some_and(|program| program == "codex")
+        self.active_command().and_then(configured_program) != Some("claude")
     }
 
     fn active_command(&self) -> Option<&str> {
@@ -572,7 +568,7 @@ fn send_keys_key(target: &str, key: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Heuristic for "the agent has finished rendering this turn". The TUI shows
+/// Claude-only heuristic for "the agent has finished rendering this turn". Its TUI shows
 /// "(esc to interrupt)" next to its live spinner while a turn is running; its
 /// absence means the turn is done. Glyph-independent, so it survives spinner
 /// wording changes (Crunched/Churned/Brewed/…).
@@ -620,6 +616,23 @@ async fn wait_for_reply_tags(
     poll_interval_ms: u64,
     require_closing_tag: bool,
 ) -> Result<String, WaitError> {
+    wait_for_reply_tags_with_capture(
+        cmd_id,
+        timeout_secs,
+        poll_interval_ms,
+        require_closing_tag,
+        || Ok((capture_pane(target)?, capture_visible_pane(target)?)),
+    )
+    .await
+}
+
+async fn wait_for_reply_tags_with_capture(
+    cmd_id: &str,
+    timeout_secs: u64,
+    poll_interval_ms: u64,
+    require_closing_tag: bool,
+    mut capture: impl FnMut() -> Result<(String, String), String>,
+) -> Result<String, WaitError> {
     let start = Instant::now();
     let timeout = Duration::from_secs(timeout_secs);
     let poll_interval = Duration::from_millis(poll_interval_ms);
@@ -631,15 +644,15 @@ async fn wait_for_reply_tags(
     let mut idle_with_opener = 0u32;
     if require_closing_tag {
         info!(
-            "TMUX: Codex reply policy active for [REPLY-{}]; matching closing tag is required",
+            "TMUX: Strict reply policy active for [REPLY-{}]; matching closing tag is required",
             cmd_id
         );
     }
     loop {
         poll_count += 1;
-        let content = capture_pane(target).map_err(WaitError::Other)?;
+        let (content, visible) = capture().map_err(WaitError::Other)?;
 
-        if usage_limit_hit(&capture_visible_pane(target).map_err(WaitError::Other)?) {
+        if usage_limit_hit(&visible) {
             return Err(WaitError::UsageLimit);
         }
 
@@ -838,6 +851,35 @@ fn extract_output(raw_output: &str, command_sent: &str, prompt: &str) -> Result<
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn agy_streaming_reply_waits_for_closer_without_sending_spinner_or_tip() {
+        let config = TmuxConfig {
+            restart_command: Some("agy --dangerously-skip-permissions".to_string()),
+            ..TmuxConfig::default()
+        };
+        // agy's live spinner does not contain Claude's "esc to interrupt".
+        // Keep the partial frame around longer than the legacy idle threshold.
+        let partial = "[REPLY-test]It is significantly better\n\
+            ⡿  Target’s commitment to chemical safety is stronger...\n\
+            └ Tip: Press ? to see keyboard shortcuts.";
+        let complete = "[REPLY-test]It is significantly better on chemical safety.\n\
+            The full labor and sustainability analysis follows.\n\
+            [/REPLY-test]\n────────────────\n>";
+        let mut polls = 0;
+        let output = wait_for_reply_tags_with_capture(
+            "test", 1, 1, config.requires_closing_reply_tag(), || {
+                polls += 1;
+                let frame = if polls <= IDLE_CONFIRM_POLLS + 1 { partial } else { complete };
+                Ok((frame.to_string(), frame.to_string()))
+            },
+        ).await.unwrap();
+
+        assert_eq!(output, complete);
+        assert_eq!(polls, IDLE_CONFIRM_POLLS + 2);
+        assert_eq!(crate::extract_reply(&output, "test").unwrap(),
+            "It is significantly better on chemical safety.\nThe full labor and sustainability analysis follows.");
+    }
+
     #[test]
     fn interactive_command_loads_bash_aliases() {
         assert_eq!(
@@ -879,8 +921,8 @@ mod tests {
     #[test]
     fn claude_keeps_the_missing_closer_fallback() {
         for restart_command in [
-            None,
             Some("claude --dangerously-skip-permissions".to_string()),
+            Some("exec /usr/local/bin/claude --dangerously-skip-permissions".to_string()),
         ] {
             let config = TmuxConfig {
                 restart_command,
@@ -888,6 +930,19 @@ mod tests {
             };
 
             assert!(!config.requires_closing_reply_tag());
+        }
+    }
+
+    #[test]
+    fn agy_and_unknown_agents_require_a_closing_reply_tag() {
+        for restart_command in [
+            None,
+            Some("agy --dangerously-skip-permissions".to_string()),
+            Some("exec env AGENT_MODE=sink /home/xeb/.local/bin/agy --dangerously-skip-permissions".to_string()),
+            Some("another-agent".to_string()),
+        ] {
+            let config = TmuxConfig { restart_command, ..TmuxConfig::default() };
+            assert!(config.requires_closing_reply_tag());
         }
     }
 
@@ -907,16 +962,16 @@ mod tests {
     #[test]
     fn fallback_switches_reply_policy_without_changing_startup_command() {
         let config = TmuxConfig {
-            restart_command: Some("agy --yolo".to_string()),
+            restart_command: Some("agy --dangerously-skip-permissions".to_string()),
             startup_command: Some("/effort low".to_string()),
-            fallback_command: Some("codex --yolo".to_string()),
+            fallback_command: Some("claude --dangerously-skip-permissions".to_string()),
             ..TmuxConfig::default()
         };
 
-        assert!(!config.requires_closing_reply_tag());
+        assert!(config.requires_closing_reply_tag());
         assert_eq!(config.startup_command.as_deref(), Some("/effort low"));
         config.fallback_active.store(true, Ordering::SeqCst);
-        assert!(config.requires_closing_reply_tag());
+        assert!(!config.requires_closing_reply_tag());
         assert_eq!(config.startup_command.as_deref(), Some("/effort low"));
     }
 
